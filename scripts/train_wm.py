@@ -30,6 +30,7 @@ import csv
 import json
 import os
 import secrets
+import subprocess
 import sys
 import time
 
@@ -45,7 +46,8 @@ from roundabout_wm.dataset import RounDWindows, load_stats
 from roundabout_wm.models.world_model import GREEN, WMConfig, WorldModel, param_counts
 from roundabout_wm.wm_eval import swap_actions, warp_previous
 
-REPORT_STEPS = (5, 10, 20)          # rollout steps reported in the logs (1 s, 2 s, 4 s at 5 Hz)
+REPORT_STEPS = (5, 10, 20)
+VAL_SEED = 1234                     # fixes which val windows are used; reseeded before every validation          # rollout steps reported in the logs (1 s, 2 s, 4 s at 5 Hz)
 
 
 def args_():
@@ -106,7 +108,7 @@ def loaders(a, cfg):
     kw = dict(batch_size=a.batch, num_workers=a.workers, pin_memory=True, drop_last=True,
               persistent_workers=a.workers > 0)
     # a fixed generator for validation: every validation sees the same windows in the same order
-    val_loader = DataLoader(va, shuffle=True, generator=torch.Generator().manual_seed(1234), **kw)
+    val_loader = DataLoader(va, shuffle=True, generator=torch.Generator().manual_seed(VAL_SEED), **kw)
     stats = stats or {"speed_mean": 0.0, "speed_std": 1.0, "action_mean": [0.0, 0.0], "action_std": [1.0, 1.0]}
     return DataLoader(tr, shuffle=True, generator=g, **kw), val_loader, len(tr), len(va), stats
 
@@ -124,6 +126,7 @@ def per_step(err):
 def validate(model, val_loader, a, dev, cfg, stats):
     """All metrics per rollout step, z from the prior unless stated, dropout off."""
     model.eval()
+    val_loader.generator.manual_seed(VAL_SEED)       # the SAME val windows every validation (comparable over time)
     n, rc, dt = cfg.data.n_cond, cfg.render, cfg.data.dt
     acc = {k: 0 for k in ("prior", "post", "empty", "copy", "warp", "kl", "std", "mass_pred", "mass_true")}
     sens, warm, nb = 0.0, 0.0, 0
@@ -189,8 +192,11 @@ def save_samples(model, batch, a, dev, n_cond, path, n_samples=3):
 
 
 def gpu_util():
+    """Instantaneous GPU utilisation in % from nvidia-smi (no pynvml needed); "" if unavailable."""
     try:
-        return torch.cuda.utilization()
+        out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        return int(out[0]) if out else ""
     except Exception:
         return ""
 
@@ -360,6 +366,7 @@ def main():
                 log.writerow(row)
                 log_f.flush()
                 sample_path = os.path.join(out_dir, f"samples_{step:06d}.png")
+                val_loader.generator.manual_seed(VAL_SEED)      # same sample scene every validation
                 save_samples(model, next(iter(val_loader)), a, dev, cfg.data.n_cond, sample_path)
                 wb.log({f"val/{k}": x for k, x in row.items()}, step)
                 wb.curves(v, step, a.n_pred)
