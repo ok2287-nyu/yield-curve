@@ -45,6 +45,90 @@ python scripts/build_cache.py   --data_dir $DATA --out_dir $SCRATCH/round_cache
 `$DATA` is the folder holding `NN_tracks.csv`, `NN_tracksMeta.csv`, `NN_recordingMeta.csv`, `NN_background.png`.
 Each person uses their own copy (rounD licence: no sharing inside the group).
 
+## Teammate setup (NYU HPC Cloud Bursting)
+
+Rules first:
+- **Never share rounD data**, not even inside the team (licence). Everyone downloads with their own approved
+  access and builds their own cache. `.gitignore` keeps data, caches, renders and checkpoints out of git; don't
+  force-add them.
+- Cloud Bursting only (account `csci_ga_2271-2026fa`); nothing on the Torch cluster.
+- Shared code is identical across runs. The only file you change for your run is `roundabout_wm/models/encoders.py`.
+
+Paths below use `$USER`, so they work for any netid; the sbatch scripts expect exactly this layout:
+
+```
+/scratch/$USER/yield/
+  round_data/      NN_tracks.csv, NN_tracksMeta.csv, NN_recordingMeta.csv, NN_background.png
+  venv/            Python environment
+  roundabout_wm/   this repo
+  round_cache/     built by step 4
+```
+
+**1. Data.** Upload your own rounD zip (e.g. `round-dataset-v1.1.zip`) through the portal's Files view, then
+put the contents of its `data/` folder into `round_data/`:
+
+```bash
+mkdir -p /scratch/$USER/yield/raw /scratch/$USER/yield/round_data
+cd /scratch/$USER/yield
+unzip ~/round-dataset-v1.1.zip -d raw            # adjust to where you uploaded it
+cp raw/*/data/* round_data/                      # adjust if the zip's folder layout differs
+ls round_data | head                              # expect 00_background.png, 00_recordingMeta.csv, ...
+```
+
+**2. Environment.** (Ojaswi's: Python 3.9, torch 2.8.0+cu128.)
+
+```bash
+cd /scratch/$USER/yield
+python3 -m venv venv && source venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install numpy pandas opencv-python-headless matplotlib imageio pillow
+```
+
+**3. Code.**
+
+```bash
+cd /scratch/$USER/yield
+git clone https://github.com/<owner>/<repo>.git roundabout_wm
+cd roundabout_wm
+python tests/test_conventions.py && python tests/test_world_model.py      # all "ok"
+```
+
+If the clone fails (no GitHub access from the node), download the repo as a zip on your laptop and upload it.
+
+**4. Build your cache** (CPU partition, no GPU hours; about an hour; resubmit if cut short, finished
+recordings are skipped):
+
+```bash
+sbatch scripts/hpc/build_cache.sbatch      # output in round_cache_<jobid>.out
+```
+
+**5. Check it matches.** The end of the job output (from `scripts/hpc/check_cache.py`) must show exactly the
+reference numbers below. If anything differs, stop and tell the team before training: the encoder comparison is
+only fair if all three caches are identical.
+
+| Quantity | Reference (Ojaswi, job 9435) |
+|---|---|
+| Recordings | 22: 2 ... 23 |
+| Split | train 2-17, val 18-20, test 21-23 |
+| Ego tracks / frames | 10,428 / 793,957 (about 9.8 GB on disk) |
+| Windows at n_pred = 20 | train 70,873, val 17,374, test 14,309 |
+| `stats.json` | speed 6.29 +/- 3.16 m/s; acceleration 0.31 +/- 0.91 m/s^2; curvature 0.0026 +/- 0.032 1/m |
+
+**6. Add your encoder** in `roundabout_wm/models/encoders.py` and register it in `build_encoder`. It must pass
+`check_encoder_contract` in `tests/test_world_model.py`: input one frame `(B, 3, 64, 64)` in [0, 1], output
+`(B, 256, 8, 8)` where cell `(r, c)` is the 8x8-pixel patch at row r, column c; deterministic in train mode
+(no dropout in the encoder, decision 17). Add a test that calls `check_encoder_contract` on it.
+
+**7. Train** only after the `cnn` run has passed the gate (`docs/experiments.md`):
+
+```bash
+sbatch --export=ALL,ENCODER=vit,RUN=vit scripts/hpc/train_wm.sbatch
+sbatch --export=ALL,ENCODER=vit,RUN=vit_mae,INIT=runs/mae/encoder.pt scripts/hpc/train_wm.sbatch
+```
+
+Use the same `STEPS` as the `cnn` run. Check GPU use on a running job with
+`srun --jobid=<id> --overlap nvidia-smi` (aim for > 50%; GPU nodes idle for 20 minutes are shut down).
+
 ## Using the dataset
 
 ```python
