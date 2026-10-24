@@ -88,7 +88,7 @@ pip install numpy pandas opencv-python-headless matplotlib imageio pillow
 
 ```bash
 cd /scratch/$USER/yield
-git clone https://github.com/<owner>/<repo>.git roundabout_wm
+git clone https://github.com/ok2287-nyu/yield-curve.git roundabout_wm
 cd roundabout_wm
 python tests/test_conventions.py && python tests/test_world_model.py      # all "ok"
 ```
