@@ -1,0 +1,23 @@
+# rounD licence: the data must never be shared, not even inside the team. Nothing derived from it either.
+round_data/
+round_cache/
+raw/
+*.csv
+!docs/*.csv
+*.npy
+*.png
+*.gif
+*.mp4
+*.zip
+cache_sample*/
+# training outputs (checkpoints, logs, sample images)
+runs/
+*.pt
+*.out
+# python / env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
