@@ -12,6 +12,7 @@ raw/
 cache_sample*/
 # training outputs (checkpoints, logs, sample images)
 runs/
+wandb/
 *.pt
 *.out
 # python / env

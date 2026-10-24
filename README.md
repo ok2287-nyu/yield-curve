@@ -81,8 +81,14 @@ ls round_data | head                              # expect 00_background.png, 00
 cd /scratch/$USER/yield
 python3 -m venv venv && source venv/bin/activate
 pip install torch --index-url https://download.pytorch.org/whl/cu128
-pip install numpy pandas opencv-python-headless matplotlib imageio pillow
+pip install numpy pandas opencv-python-headless matplotlib imageio pillow wandb
+wandb login          # once; paste your API key from wandb.ai/authorize (stored in ~/.netrc)
 ```
+
+Weights & Biases is optional (`WANDB=1` on the sbatch line). All three runs should log to the same W&B project
+so they can be compared side by side: set `export WANDB_ENTITY=<team>` (and keep the default project
+`yield-curve`) in your `~/.bashrc`. If a compute node has no internet, use `WANDB=offline` and later run
+`wandb sync runs/<run>/wandb/offline-run-*` from the login node. `runs/<run>/log.csv` is written either way.
 
 **3. Code.**
 
@@ -122,8 +128,8 @@ only fair if all three caches are identical.
 **7. Train** only after the `cnn` run has passed the gate (`docs/experiments.md`):
 
 ```bash
-sbatch --export=ALL,ENCODER=vit,RUN=vit scripts/hpc/train_wm.sbatch
-sbatch --export=ALL,ENCODER=vit,RUN=vit_mae,INIT=runs/mae/encoder.pt scripts/hpc/train_wm.sbatch
+sbatch --export=ALL,ENCODER=vit,RUN=vit,WANDB=1 scripts/hpc/train_wm.sbatch
+sbatch --export=ALL,ENCODER=vit,RUN=vit_mae,INIT=runs/mae/encoder.pt,WANDB=1 scripts/hpc/train_wm.sbatch
 ```
 
 Use the same `STEPS` as the `cnn` run. Check GPU use on a running job with

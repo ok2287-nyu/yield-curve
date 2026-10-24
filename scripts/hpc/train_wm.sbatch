@@ -7,6 +7,8 @@
 #   sbatch --export=ALL,ENCODER=vit,RUN=vit_mae,INIT=runs/mae/encoder.pt scripts/hpc/train_wm.sbatch
 #   sbatch --export=ALL,ENCODER=cnn,RUN=cnn_nosg,EXTRA_ARGS=--no-prior_sg scripts/hpc/train_wm.sbatch   # ablation
 # Optional: STEPS=<n> (decide after timing the first run; identical for all runs).
+#           WANDB=1 to also log to Weights & Biases (one-time setup: pip install wandb; wandb login).
+#           WANDB=offline if the node has no internet; then `wandb sync runs/<RUN>/wandb/offline-run-*`.
 #SBATCH --job-name=wm
 #SBATCH --account=csci_ga_2271-2026fa
 #SBATCH --partition=c12m85-a100-1
@@ -26,5 +28,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 ARGS="${EXTRA_ARGS:-}"
 if [ -n "${INIT:-}" ]; then ARGS="$ARGS --init_encoder $INIT"; fi
 if [ -n "${STEPS:-}" ]; then ARGS="$ARGS --steps $STEPS"; fi
+if [ -n "${WANDB:-}" ]; then
+  ARGS="$ARGS --wandb"
+  if [ "$WANDB" = "offline" ]; then export WANDB_MODE=offline; fi
+fi
 python scripts/train_wm.py --cache "$ROOT/round_cache" --encoder "${ENCODER:-cnn}" --run "${RUN:-cnn}" \
   --workers 10 $ARGS

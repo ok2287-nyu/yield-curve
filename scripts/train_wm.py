@@ -19,11 +19,17 @@ Validation (val recordings, dropout OFF), all per rollout step, summarised at 1 
     act_sens     mean |change| of the prediction when the future actions are swapped between samples
                  (speeds re-integrated from the swapped accelerations); ~0 = the model ignores the ego
 Every validation also writes samples_<step>.png: true future, 3 prior samples, and the prior sigma map.
+
+Weights & Biases (optional, --wandb): the same train/val numbers as log.csv, the per-step error curves
+(model vs baselines over the whole 4 s), and the sample grids. log.csv stays the source of truth. The W&B run id is
+kept in runs/<run>/wandb_id.txt, so a requeued job continues the same W&B run. If the compute node has no
+internet, run with WANDB_MODE=offline and later `wandb sync runs/<run>/wandb/offline-run-*` from a login node.
 """
 import argparse
 import csv
 import json
 import os
+import secrets
 import sys
 import time
 
@@ -69,6 +75,9 @@ def args_():
     p.add_argument("--workers", type=int, default=6)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_windows", type=int, default=None, help="debug: use only the first N windows per split")
+    p.add_argument("--wandb", action="store_true", help="also log to Weights & Biases")
+    p.add_argument("--wandb_project", default=os.environ.get("WANDB_PROJECT", "yield-curve"))
+    p.add_argument("--wandb_entity", default=os.environ.get("WANDB_ENTITY"), help="W&B team/user; shared team = one place")
     a = p.parse_args()
     if a.enc_lr_mult is None:
         a.enc_lr_mult = 0.1 if a.init_encoder else 1.0
@@ -192,6 +201,63 @@ LOG_FIELDS = (["step", "split", "loss", "mse", "mse_warm", "kl", "prior_std", "a
                                                              "std")])
 
 
+class WandB:
+    """Thin optional wrapper: every method is a no-op when W&B is off, and a W&B failure never stops training."""
+
+    def __init__(self, a, out_dir, extra_config):
+        self.run = None
+        if not a.wandb:
+            return
+        try:
+            import wandb
+            id_path = os.path.join(out_dir, "wandb_id.txt")
+            run_id = open(id_path).read().strip() if os.path.exists(id_path) else secrets.token_hex(6)
+            open(id_path, "w").write(run_id)
+            self.wandb = wandb
+            self.run = wandb.init(project=a.wandb_project, entity=a.wandb_entity, name=a.run, id=run_id,
+                                  resume="allow", dir=out_dir, config={**vars(a), **extra_config},
+                                  group=a.encoder, job_type="train_wm")
+            print(f"W&B: {self.run.url}")
+        except Exception as e:                                           # no login, no network, not installed ...
+            print(f"WARNING: W&B disabled ({type(e).__name__}: {e}); log.csv is still written")
+            self.run = None
+
+    def log(self, d, step):
+        if self.run is None:
+            return
+        try:
+            self.run.log({k: v for k, v in d.items() if v != "" and k.split("/")[-1] not in ("step", "split", "time")}, step=step)
+        except Exception as e:
+            print(f"WARNING: W&B log failed ({e})")
+
+    def curves(self, v, step, n_pred):
+        """The whole 1..n_pred error curve of the model against the baselines, as one chart per validation."""
+        if self.run is None:
+            return
+        try:
+            xs = [0.2 * k for k in range(1, n_pred + 1)]
+            names = ["prior", "post", "empty", "copy", "warp"]
+            chart = self.wandb.plot.line_series(xs=xs, ys=[v[k].tolist() for k in names], keys=names,
+                                                title=f"val MSE per horizon (step {step})", xname="horizon (s)")
+            self.run.log({"val/mse_curve": chart}, step=step)
+        except Exception as e:
+            print(f"WARNING: W&B curve failed ({e})")
+
+    def image(self, path, step):
+        if self.run is None:
+            return
+        try:
+            self.run.log({"val/samples": self.wandb.Image(path, caption="truth / 3 prior samples / prior sigma")},
+                         step=step)
+        except Exception as e:
+            print(f"WARNING: W&B image failed ({e})")
+
+    def finish(self, best):
+        if self.run is not None:
+            self.run.summary["best_val_mse_prior"] = best
+            self.run.finish()
+
+
 def main():
     a = args_()
     torch.manual_seed(a.seed)
@@ -216,6 +282,7 @@ def main():
     pc = param_counts(model)
     print("params (M): " + ", ".join(f"{k} {v / 1e6:.2f}" for k, v in pc.items()))
     json.dump(pc, open(os.path.join(out_dir, "params.json"), "w"), indent=1)
+    wb = WandB(a, out_dir, {"params": pc, "n_train_windows": n_tr, "n_val_windows": n_va, "wm_cfg": vars(wm_cfg)})
 
     step, best = 0, float("inf")
     ckpt = os.path.join(out_dir, "last.pt")
@@ -272,6 +339,8 @@ def main():
                 log.writerow({"step": step, "split": "train", **m, "s_per_step": sps, "gpu_util": gu,
                               "time": time.time()})
                 log_f.flush()
+                wb.log({f"train/{k}": x for k, x in m.items()} | {"train/s_per_step": sps, "train/gpu_util": gu},
+                       step)
                 run = {k: 0.0 for k in keys}; run_n = 0; t0 = time.time()
 
             if step % a.val_every == 0 or step >= a.steps:
@@ -290,8 +359,11 @@ def main():
                       f"gap(prior-post) mean {v['gap'].mean().item():.5f}")
                 log.writerow(row)
                 log_f.flush()
-                save_samples(model, next(iter(val_loader)), a, dev, cfg.data.n_cond,
-                             os.path.join(out_dir, f"samples_{step:06d}.png"))
+                sample_path = os.path.join(out_dir, f"samples_{step:06d}.png")
+                save_samples(model, next(iter(val_loader)), a, dev, cfg.data.n_cond, sample_path)
+                wb.log({f"val/{k}": x for k, x in row.items()}, step)
+                wb.curves(v, step, a.n_pred)
+                wb.image(sample_path, step)
                 if v["prior"].mean().item() < best:
                     best = v["prior"].mean().item()
                     save(os.path.join(out_dir, "best.pt"))
@@ -301,6 +373,7 @@ def main():
             if step >= a.steps:
                 break
     save(ckpt)
+    wb.finish(best)
     print(f"done at step {step}, best val mse (prior) {best:.5f}")
 
 
