@@ -39,19 +39,34 @@ def warp_previous(green_src, pose_src, pose_tgt, rc: RenderConfig):
     return out.unflatten(0, (B, T))
 
 
-def swap_actions(actions, speeds, ego_state, n_cond, stats, dt, shift=1):
-    """Counterfactual inputs: rollout actions act[n_cond-1:] taken from sample (b - shift) of the batch.
-
-    Warm-up actions/speeds are untouched; speeds v[n_cond..] are re-integrated from the sample's own v[n_cond-1]
-    with v' = max(v + acc*dt, 0) (kinematics.step_torch), then normalised. Returns (actions, speeds), normalised.
-    """
-    a_mean = torch.tensor(stats["action_mean"], device=actions.device)
-    a_std = torch.tensor(stats["action_std"], device=actions.device)
-    act = actions.clone()
-    act[:, n_cond - 1:] = torch.roll(actions[:, n_cond - 1:], shift, 0)
+def _reintegrate_speeds(act, ego_state, n_cond, stats, dt):
+    """Future speeds implied by (normalised) actions: v[i+1] = max(v[i] + acc[i]*dt, 0) from the sample's own
+    v[n_cond-1] (kinematics.step_torch), returned normalised (B, L, 1). Warm-up speeds are the logged ones."""
+    a_mean = torch.tensor(stats["action_mean"], device=act.device)
+    a_std = torch.tensor(stats["action_std"], device=act.device)
     acc = act[..., 0] * a_std[0] + a_mean[0]                                    # raw m/s^2, (B, L-1)
     v = ego_state[:, :, 3].clone()                                              # raw m/s, (B, L)
     for i in range(n_cond - 1, v.shape[1] - 1):
         v[:, i + 1] = torch.clamp(v[:, i] + acc[:, i] * dt, min=0.0)
-    spd = ((v - stats["speed_mean"]) / stats["speed_std"])[..., None]
-    return act, spd.to(speeds.dtype)
+    return ((v - stats["speed_mean"]) / stats["speed_std"])[..., None]
+
+
+def swap_actions(actions, speeds, ego_state, n_cond, stats, dt, shift=1):
+    """Counterfactual inputs: rollout actions act[n_cond-1:] taken from sample (b - shift) of the batch.
+
+    Warm-up actions/speeds are untouched; future speeds are re-integrated from the swapped accelerations.
+    Returns (actions, speeds), normalised.
+    """
+    act = actions.clone()
+    act[:, n_cond - 1:] = torch.roll(actions[:, n_cond - 1:], shift, 0)
+    return act, _reintegrate_speeds(act, ego_state, n_cond, stats, dt).to(speeds.dtype)
+
+
+def counterfactual_accel(actions, ego_state, n_cond, stats, dt, accel):
+    """Same scene, but every rollout step uses a constant acceleration `accel` (m/s^2); curvature as logged.
+    Returns (actions, speeds), normalised. (The speed floor at 0 means 'brake' ends in a stop.)"""
+    a_mean = torch.tensor(stats["action_mean"], device=actions.device)
+    a_std = torch.tensor(stats["action_std"], device=actions.device)
+    act = actions.clone()
+    act[:, n_cond - 1:, 0] = (accel - a_mean[0]) / a_std[0]
+    return act, _reintegrate_speeds(act, ego_state, n_cond, stats, dt).to(actions.dtype)

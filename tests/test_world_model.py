@@ -14,7 +14,7 @@ from roundabout_wm.config import Config
 from roundabout_wm.models.encoders import build_encoder
 from roundabout_wm.models.world_model import StickyDropout2d, WMConfig, WorldModel
 from roundabout_wm.render import render_frame
-from roundabout_wm.wm_eval import swap_actions, warp_previous
+from roundabout_wm.wm_eval import counterfactual_accel, swap_actions, warp_previous
 
 N_COND, N_PRED, B = 10, 6, 2
 L = N_COND + N_PRED
@@ -152,6 +152,18 @@ def test_swap_actions_keeps_warmup_and_kinematics():
     acc = a2[0, :, 0] * 0.9 + 0.3
     assert torch.allclose(v[N_COND], torch.clamp(v[N_COND - 1] + acc[N_COND - 1] * 0.2, min=0), atol=1e-5)
 
+
+
+def test_counterfactual_accel_brakes_to_a_stop():
+    stats = {"speed_mean": 6.0, "speed_std": 3.0, "action_mean": [0.3, 0.0], "action_std": [0.9, 0.03]}
+    act = torch.randn(B, L - 1, 2)
+    state = torch.zeros(B, L, 4); state[:, :, 3] = 5.0
+    a2, s2 = counterfactual_accel(act, state, N_COND, stats, 0.2, -3.0)
+    assert torch.equal(a2[:, :N_COND - 1], act[:, :N_COND - 1])                 # warm-up untouched
+    assert torch.allclose(a2[:, N_COND - 1:, 0] * 0.9 + 0.3, torch.tensor(-3.0))  # constant -3 m/s^2
+    assert torch.equal(a2[..., 1], act[..., 1])                                 # curvature as logged
+    v = s2[0, :, 0] * 3.0 + 6.0
+    assert torch.allclose(v[N_COND], torch.tensor(5.0 - 0.6), atol=1e-5) and v.min() >= 0
 
 
 if __name__ == "__main__":
