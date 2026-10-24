@@ -94,7 +94,7 @@ so they can be compared side by side: set `export WANDB_ENTITY=<team>` (and keep
 
 ```bash
 cd /scratch/$USER/yield
-git clone https://github.com/<owner>/<repo>.git roundabout_wm
+git clone https://github.com/ok2287-nyu/yield-curve.git roundabout_wm
 cd roundabout_wm
 python tests/test_conventions.py && python tests/test_world_model.py      # all "ok"
 ```
