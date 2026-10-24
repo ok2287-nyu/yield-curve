@@ -37,6 +37,17 @@ parameter count before claiming architecture is the reason.
 | act_sens | mean change in prediction when future actions are swapped (speeds re-integrated) | clearly above 0 |
 | samples_*.png | rows: truth, 3 prior samples, prior sigma map (white = sigma >= 1.5) | cars stay sharp; samples differ where the future is uncertain |
 
+## Looking at the predictions
+
+```bash
+python scripts/inspect_wm.py --ckpt runs/<run>/best.pt --cache $C          # 6 val scenes with traffic
+```
+
+Writes `runs/<run>/inspect_<step>/scene_<idx>.png` (+ `.gif`, `summary.csv`): truth, posterior, K prior samples,
+their mean and spread, and brake / speed-up counterfactuals. The script's docstring maps each visual pattern to a
+cause (z too weak, z ignored under the prior, prior cannot produce the right z, drift over the horizon, actions
+ignored). The images are rendered rounD data: keep them local.
+
 ## Budget
 
 300 GPU hours per person on 1xA100 (`c12m85-a100-1`). Read `s_per_step` and `gpu_util` from the first minutes of

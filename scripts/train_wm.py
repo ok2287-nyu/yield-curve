@@ -16,6 +16,8 @@ Validation (val recordings, dropout OFF), all per rollout step, summarised at 1 
     kl_t         KL(q || p) per step
     prior_std_t  mean prior sigma per step (flat or shrinking towards 0 = deterministic prior)
     mass_t       predicted / true green mass per step (falling = cars fading)
+    spread_t     mean |difference| between two prior samples of the same window (~0 = z is ignored under the
+                 prior, so samples cannot differ: the model is effectively deterministic)
     act_sens     mean |change| of the prediction when the future actions are swapped between samples
                  (speeds re-integrated from the swapped accelerations); ~0 = the model ignores the ego
 Every validation also writes samples_<step>.png: true future, 3 prior samples, and the prior sigma map.
@@ -128,7 +130,8 @@ def validate(model, val_loader, a, dev, cfg, stats):
     model.eval()
     val_loader.generator.manual_seed(VAL_SEED)       # the SAME val windows every validation (comparable over time)
     n, rc, dt = cfg.data.n_cond, cfg.render, cfg.data.dt
-    acc = {k: 0 for k in ("prior", "post", "empty", "copy", "warp", "kl", "std", "mass_pred", "mass_true")}
+    acc = {k: 0 for k in ("prior", "post", "empty", "copy", "warp", "kl", "std", "mass_pred", "mass_true",
+                          "spread")}
     sens, warm, nb = 0.0, 0.0, 0
     for i, b in enumerate(val_loader):
         if i >= a.val_batches:
@@ -143,6 +146,8 @@ def validate(model, val_loader, a, dev, cfg, stats):
         act_sw, spd_sw = swap_actions(act, spd, st, n, stats, dt)
         out_sw = model(imgs, act_sw, spd_sw, a.n_pred, z_source="prior")
         post = model(imgs, act, spd, a.n_pred, z_source="post")
+        torch.manual_seed(4321 + i)                                   # a second, independent prior sample
+        out2 = model(imgs, act, spd, a.n_pred, z_source="prior")
 
         last = imgs[:, n - 1, GREEN:GREEN + 1]
         warp = warp_previous(last, st[:, n - 1, :3], st[:, n:n + a.n_pred, :3], rc)
@@ -153,6 +158,7 @@ def validate(model, val_loader, a, dev, cfg, stats):
         acc["warp"] = acc["warp"] + per_step((warp - tgt) ** 2)
         acc["kl"] = acc["kl"] + post["kl"].mean(0)
         acc["std"] = acc["std"] + out["prior_std"].mean(0)
+        acc["spread"] = acc["spread"] + (out["green"] - out2["green"]).abs().float().mean((0, 2, 3, 4))
         acc["mass_pred"] = acc["mass_pred"] + out["green"].float().sum((2, 3, 4)).mean(0)
         acc["mass_true"] = acc["mass_true"] + tgt.sum((2, 3, 4)).mean(0)
         sens += (out["green"] - out_sw["green"]).abs().float().mean().item()
@@ -204,7 +210,7 @@ def gpu_util():
 LOG_FIELDS = (["step", "split", "loss", "mse", "mse_warm", "kl", "prior_std", "act_sens", "gap_mean", "s_per_step",
                "gpu_util", "time"]
               + [f"{m}@{k}" for k in REPORT_STEPS for m in ("prior", "post", "empty", "copy", "warp", "mass", "kl",
-                                                             "std")])
+                                                             "std", "spread")])
 
 
 class WandB:
@@ -310,8 +316,12 @@ def main():
 
     log_path = os.path.join(out_dir, "log.csv")
     new_log = not os.path.exists(log_path)
+    fields = LOG_FIELDS
+    if not new_log:                                  # resuming: keep the file's own columns (older code may differ)
+        with open(log_path) as f:
+            fields = next(csv.reader(f), LOG_FIELDS) or LOG_FIELDS
     log_f = open(log_path, "a", newline="")
-    log = csv.DictWriter(log_f, fieldnames=LOG_FIELDS)
+    log = csv.DictWriter(log_f, fieldnames=fields, extrasaction="ignore")
     if new_log:
         log.writeheader()
 
@@ -355,11 +365,11 @@ def main():
                        "kl": v["kl"].mean().item(), "prior_std": v["std"].mean().item(),
                        "act_sens": v["act_sens"], "gap_mean": v["gap"].mean().item(), "time": time.time()}
                 print(f"  VAL (step {step})        " + "  ".join(f"{k * 0.2:.0f}s" .rjust(9) for k in REPORT_STEPS))
-                for name in ("prior", "post", "empty", "copy", "warp", "mass", "kl", "std"):
+                for name in ("prior", "post", "empty", "copy", "warp", "mass", "spread", "kl", "std"):
                     vals = [v[name][min(k, len(v[name])) - 1].item() for k in REPORT_STEPS]
                     for k, x in zip(REPORT_STEPS, vals):
                         row[f"{name}@{k}"] = x
-                    fmt = "{:9.1f}" if name == "kl" else "{:9.5f}" if name not in ("mass", "std") else "{:9.3f}"
+                    fmt = "{:9.1f}" if name == "kl" else "{:9.3f}" if name in ("mass", "std") else "{:9.5f}"
                     print(f"    {name:6s}               " + "  ".join(fmt.format(x) for x in vals))
                 print(f"    act_sens {v['act_sens']:.5f} | warm-up mse {v['mse_warm']:.5f} | "
                       f"gap(prior-post) mean {v['gap'].mean().item():.5f}")
