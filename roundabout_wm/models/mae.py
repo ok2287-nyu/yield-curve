@@ -58,7 +58,7 @@ class MAE(nn.Module):
             masked = torch.ones(B, self.encoder.grid ** 2, dtype=torch.bool, device=x.device)
             masked.scatter_(1, keep_idx, False)
         vis = self.embed(self.encoder.tokens(x, keep_idx))                         # (B, keep, dec_dim)
-        full = self.mask_token.expand(B, masked.shape[1], -1).clone()              # (B, 64, dec_dim)
+        full = self.mask_token.expand(B, masked.shape[1], -1).to(vis.dtype).clone()   # (B, 64, dec_dim); bf16 under autocast
         full.scatter_(1, keep_idx[..., None].expand_as(vis), vis)
         pred = self.head(self.dec_norm(self.dec_blocks(full + self.dec_pos)))
         tgt = patchify(x, self.patch)
