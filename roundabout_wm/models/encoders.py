@@ -14,6 +14,7 @@ Runs:
 """
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
 
 
@@ -35,9 +36,38 @@ class CNNEncoder(nn.Module):
         return self.net(x)
 
 
+class ViTEncoder(nn.Module):
+    """8x8-pixel patches -> 64 tokens -> linear to `hidden` + learned positional embedding -> 6 pre-norm transformer
+    blocks (8 heads, MLP ratio 2, no dropout: decision 17) -> LayerNorm -> reshape to (hidden, 8, 8).
+    Token i is grid cell i, row-major. `tokens(x, keep)` runs only the kept tokens (used by MAE pretraining)."""
+
+    def __init__(self, in_ch: int = 3, hidden: int = 256, patch: int = 8, img: int = 64,
+                 depth: int = 6, heads: int = 8, mlp_ratio: int = 2):
+        super().__init__()
+        self.grid = img // patch
+        self.patch_embed = nn.Conv2d(in_ch, hidden, patch, stride=patch)      # = linear on each flattened patch
+        self.pos = nn.Parameter(torch.zeros(1, self.grid ** 2, hidden))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        block = nn.TransformerEncoderLayer(hidden, heads, hidden * mlp_ratio, dropout=0.0, activation="gelu",
+                                           batch_first=True, norm_first=True)
+        self.blocks = nn.TransformerEncoder(block, depth, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(hidden)
+
+    def tokens(self, x, keep=None):
+        """x: (B, 3, 64, 64). keep: optional (B, K) indices of the tokens to run. Returns (B, K or 64, hidden)."""
+        t = self.patch_embed(x).flatten(2).transpose(1, 2) + self.pos          # (B, 64, hidden), row-major
+        if keep is not None:
+            t = t.gather(1, keep[..., None].expand(-1, -1, t.shape[-1]))
+        return self.norm(self.blocks(t))
+
+    def forward(self, x):
+        t = self.tokens(x)
+        return t.transpose(1, 2).reshape(x.shape[0], -1, self.grid, self.grid)
+
+
 def build_encoder(kind: str, hidden: int = 256) -> nn.Module:
     if kind == "cnn":
         return CNNEncoder(3, hidden)
     if kind == "vit":
-        raise NotImplementedError("the vit encoder is owned by the vit run; add it here, meeting the contract above")
+        return ViTEncoder(3, hidden)
     raise ValueError(f"unknown encoder {kind!r}")
