@@ -71,6 +71,16 @@ def test_backward_and_weights_load_into_vit():
     check_encoder_contract(fresh)
 
 
+def test_forward_backward_under_bf16_autocast():
+    """The training loop runs under bf16 autocast on GPU: scatter needs matching dtypes (regression, job 12010)."""
+    m = MAE()
+    x = (torch.rand(2, 3, 64, 64) > 0.9).float()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        loss, *_ = m(x)
+    loss.backward()
+    assert torch.isfinite(loss)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
