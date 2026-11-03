@@ -5,6 +5,10 @@
     python scripts/train_wm.py --cache $C --encoder vit --init_encoder runs/mae/encoder.pt --run vit_mae
     python scripts/train_wm.py --cache $C --encoder cnn --run cnn_nosg --no-prior_sg     # stop-gradient ablation
 
+Two-stage (PPUU-style warm start):
+    python scripts/train_wm.py --cache $C --encoder cnn --run cnn_det --deterministic                  # stage 1
+    python scripts/train_wm.py --cache $C --encoder cnn --run cnn_ws --init_from runs/cnn_det/best.pt   # stage 2
+
 Rerunning the same command resumes from runs/<run>/last.pt (written every --ckpt_minutes), which is what makes
 #SBATCH --requeue and the Cloud Bursting idle shutdown survivable.
 
@@ -60,6 +64,10 @@ def args_():
     p.add_argument("--runs_dir", default="runs")
     p.add_argument("--encoder", default="cnn", choices=["cnn", "vit"])
     p.add_argument("--init_encoder", default=None, help="MAE-pretrained encoder weights (vit only)")
+    p.add_argument("--deterministic", action="store_true",
+                   help="stage 1: no z, no prior/posterior, no KL (the model learns the conditional mean)")
+    p.add_argument("--init_from", default=None,
+                   help="stage 2: warm-start from a stage-1 checkpoint (prior, posterior, P_z start fresh)")
     p.add_argument("--enc_lr_mult", type=float, default=None,
                    help="encoder lr multiplier; default 0.1 with --init_encoder, else 1.0")
     p.add_argument("--n_pred", type=int, default=cfg.data.n_pred)
@@ -85,6 +93,8 @@ def args_():
     a = p.parse_args()
     if a.enc_lr_mult is None:
         a.enc_lr_mult = 0.1 if a.init_encoder else 1.0
+    if a.deterministic and a.init_from:
+        p.error("--init_from is for the stochastic stage 2; drop --deterministic")
     return a
 
 
@@ -141,13 +151,15 @@ def validate(model, val_loader, a, dev, cfg, stats):
         tgt = imgs[:, n:n + a.n_pred, GREEN:GREEN + 1]
 
         torch.manual_seed(1234 + i)
+        det = model.cfg.deterministic
         out = model(imgs, act, spd, a.n_pred, z_source="prior")
         torch.manual_seed(1234 + i)                                   # same noise, other sample's future actions
         act_sw, spd_sw = swap_actions(act, spd, st, n, stats, dt)
         out_sw = model(imgs, act_sw, spd_sw, a.n_pred, z_source="prior")
-        post = model(imgs, act, spd, a.n_pred, z_source="post")
+        # deterministic: there is no posterior and two samples are identical, so reuse `out` (post/gap/kl/spread = 0)
+        post = out if det else model(imgs, act, spd, a.n_pred, z_source="post")
         torch.manual_seed(4321 + i)                                   # a second, independent prior sample
-        out2 = model(imgs, act, spd, a.n_pred, z_source="prior")
+        out2 = out if det else model(imgs, act, spd, a.n_pred, z_source="prior")
 
         last = imgs[:, n - 1, GREEN:GREEN + 1]
         warp = warp_previous(last, st[:, n - 1, :3], st[:, n:n + a.n_pred, :3], rc)
@@ -156,7 +168,7 @@ def validate(model, val_loader, a, dev, cfg, stats):
         acc["empty"] = acc["empty"] + per_step(tgt ** 2)
         acc["copy"] = acc["copy"] + per_step((last[:, None] - tgt) ** 2)
         acc["warp"] = acc["warp"] + per_step((warp - tgt) ** 2)
-        acc["kl"] = acc["kl"] + post["kl"].mean(0)
+        acc["kl"] = acc["kl"] + (0 * per_step(tgt) if det else post["kl"].mean(0))
         acc["std"] = acc["std"] + out["prior_std"].mean(0)
         acc["spread"] = acc["spread"] + (out["green"] - out2["green"]).abs().float().mean((0, 2, 3, 4))
         acc["mass_pred"] = acc["mass_pred"] + out["green"].float().sum((2, 3, 4)).mean(0)
@@ -281,10 +293,11 @@ def main():
     json.dump(vars(a), open(os.path.join(out_dir, "args.json"), "w"), indent=1)
 
     train_loader, val_loader, n_tr, n_va, stats = loaders(a, cfg)
-    print(f"device {dev} | train windows {n_tr} | val windows {n_va} | n_pred {a.n_pred} | prior_sg {a.prior_sg}")
+    print(f"device {dev} | train windows {n_tr} | val windows {n_va} | n_pred {a.n_pred} | "
+          f"{'DETERMINISTIC (stage 1)' if a.deterministic else f'prior_sg {a.prior_sg} beta {a.beta}'}")
 
     wm_cfg = WMConfig(encoder=a.encoder, n_cond=cfg.data.n_cond, z_ch=a.z_ch, dropout=a.dropout,
-                      p_zdrop=a.p_zdrop, beta=a.beta, prior_sg=a.prior_sg)
+                      p_zdrop=a.p_zdrop, beta=a.beta, prior_sg=a.prior_sg, deterministic=a.deterministic)
     model = WorldModel(wm_cfg).to(dev)
     enc_params = list(model.encoder.parameters())
     enc_ids = {id(p) for p in enc_params}
@@ -304,6 +317,15 @@ def main():
         step, best = s["step"], s["best"]
         torch.manual_seed(a.seed + step)                              # do not replay the same z/dropout noise
         print(f"resumed from step {step}")
+    elif a.init_from:
+        src = torch.load(a.init_from, map_location=dev)
+        if not src["wm_cfg"].get("deterministic", False):
+            print(f"WARNING: {a.init_from} is not a deterministic (stage-1) checkpoint")
+        if src["wm_cfg"]["encoder"] != a.encoder:
+            raise ValueError(f"--init_from has encoder {src['wm_cfg']['encoder']}, this run {a.encoder}")
+        copied = model.load_warm_start(src["model"])
+        print(f"warm start from {a.init_from} (step {src['step']}): {len(copied)} tensors copied; "
+              f"prior, posterior, P_z fresh (P_z weight = 0)")
     elif a.init_encoder:
         assert a.encoder == "vit", "MAE weights only fit the vit encoder"
         model.encoder.load_state_dict(torch.load(a.init_encoder, map_location=dev))

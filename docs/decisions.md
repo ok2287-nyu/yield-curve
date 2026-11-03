@@ -21,6 +21,7 @@
 | Action path | (acc, curv, speed) only into Pred through A; never into the prior or posterior | Matches PPUU and PlaNet; the prior reacts to the ego one step (0.2 s) later |
 | Stop-gradient on prior samples | on (`--prior_sg`, default); `--no-prior_sg` for the ablation. KL balancing not used | Without it the MSE on z-dropout prior steps drives sigma_p to 0; with it the prior head learns only from the KL (adopted Oct 23) |
 | Dropout | Dropout2d 0.1 in Pred (input and state) and Dec; none in the encoder or prior head | Epistemic estimate for the policy; the encoder only sees real frames; sigma_p stays aleatoric |
+| Two-stage training | stage 1 `--deterministic` (z = 0, no prior/posterior/KL); stage 2 `--init_from` stage 1, prior/posterior/P_z fresh with P_z's weight = 0 | PPUU warm-starts its stochastic model from a deterministic one (`warmstart=1` in its code). Stage 1 is open loop in h, so no exposure bias; stage 2 starts exactly at stage 1 and z can only add what the mean cannot predict |
 | Frame for prediction | ego-centric (fixed-frame prediction deferred) | Reopen if v1 loses to warp-previous or fails the geometry test |
 | Prediction target | green channel only; red/blue at t+1 come from the ego pose | Model learns only how others move |
 | Output | plain sigmoid, no residual on a previous frame | Latent stepping has no previous frame to add |

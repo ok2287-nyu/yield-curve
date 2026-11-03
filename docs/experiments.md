@@ -17,6 +17,18 @@ Adding an encoder: implement it in `models/encoders.py`, register it in `build_e
 Parameter counts are written to `runs/<run>/params.json`. If `vit` wins, also run a ViT with about the CNN's
 parameter count before claiming architecture is the reason.
 
+## Two-stage training (current recipe for the CNN run)
+
+```bash
+# stage 1: deterministic world model (the conditional mean)
+sbatch --export=ALL,ENCODER=cnn,RUN=cnn_det,STEPS=10000,WANDB=1,EXTRA_ARGS="--deterministic" scripts/hpc/train_wm.sbatch
+# stage 2: stochastic, warm-started from stage 1
+sbatch --export=ALL,ENCODER=cnn,RUN=cnn_ws,STEPS=10000,WANDB=1,EXTRA_ARGS="--init_from runs/cnn_det/best.pt --beta 1e-4" scripts/hpc/train_wm.sbatch
+```
+
+Stage 1 should already beat empty and warp and keep green mass near 1 (blurry but complete). If it fades too,
+the problem is in Pred/Dec, not in z. Stage 2 should improve on stage 1 without a large posterior/prior gap.
+
 ## Order and gate
 
 1. `cnn` first, alone. Gate before anyone trains `vit` / `vit_mae`: beats predict-empty and warp-previous at
