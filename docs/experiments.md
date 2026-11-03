@@ -49,6 +49,17 @@ the problem is in Pred/Dec, not in z. Stage 2 should improve on stage 1 without 
 | act_sens | mean change in prediction when future actions are swapped (speeds re-integrated) | clearly above 0 |
 | samples_*.png | rows: truth, 3 prior samples, prior sigma map (white = sigma >= 1.5) | cars stay sharp; samples differ where the future is uncertain |
 
+## Field of view: vehicles the model could not have seen
+
+```bash
+python scripts/fov_popin.py --data_dir ../round_data            # CPU only, a few minutes; writes fov_popin.csv
+```
+
+Share of windows where a road user that was never visible during warm-up enters the crop by 1 / 2 / 4 s, its
+share of the visible box area, and how often such a pop-in comes within 15 m of the ego, for the current crop,
+the same crop with the ego lower (row 55), and a 96 m crop. A bigger crop has longer edges, so more far-away
+pop-ins: compare the area share and the close-pop-in rate, not just the window count.
+
 ## Looking at the predictions
 
 ```bash
