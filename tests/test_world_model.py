@@ -14,7 +14,7 @@ from roundabout_wm.config import Config
 from roundabout_wm.models.encoders import build_encoder
 from roundabout_wm.models.world_model import StickyDropout2d, WMConfig, WorldModel
 from roundabout_wm.render import render_frame
-from roundabout_wm.wm_eval import swap_actions, warp_previous
+from roundabout_wm.wm_eval import counterfactual_accel, swap_actions, warp_previous
 
 N_COND, N_PRED, B = 10, 6, 2
 L = N_COND + N_PRED
@@ -152,6 +152,56 @@ def test_swap_actions_keeps_warmup_and_kinematics():
     acc = a2[0, :, 0] * 0.9 + 0.3
     assert torch.allclose(v[N_COND], torch.clamp(v[N_COND - 1] + acc[N_COND - 1] * 0.2, min=0), atol=1e-5)
 
+
+
+def test_counterfactual_accel_brakes_to_a_stop():
+    stats = {"speed_mean": 6.0, "speed_std": 3.0, "action_mean": [0.3, 0.0], "action_std": [0.9, 0.03]}
+    act = torch.randn(B, L - 1, 2)
+    state = torch.zeros(B, L, 4); state[:, :, 3] = 5.0
+    a2, s2 = counterfactual_accel(act, state, N_COND, stats, 0.2, -3.0)
+    assert torch.equal(a2[:, :N_COND - 1], act[:, :N_COND - 1])                 # warm-up untouched
+    assert torch.allclose(a2[:, N_COND - 1:, 0] * 0.9 + 0.3, torch.tensor(-3.0))  # constant -3 m/s^2
+    assert torch.equal(a2[..., 1], act[..., 1])                                 # curvature as logged
+    v = s2[0, :, 0] * 3.0 + 6.0
+    assert torch.allclose(v[N_COND], torch.tensor(5.0 - 0.6), atol=1e-5) and v.min() >= 0
+
+
+def test_deterministic_never_reads_the_future_and_has_no_kl():
+    m, b = _model(deterministic=True), _batch()
+    imgs = b["images"].clone()
+    imgs[:, N_COND:] = float("nan")                                 # any read of a future frame would poison the output
+    for src in ("mix", "post", "prior"):                            # every z_source is forced to z = 0
+        out = m(imgs, b["actions"], b["speed"], N_PRED, z_source=src)
+        assert torch.isfinite(out["green"]).all() and out["kl"] is None
+    loss, logs = m.loss({**b, "images": torch.nan_to_num(imgs)}, N_PRED)
+    loss.backward()
+    assert logs["kl"] == 0.0
+    assert all(p.grad is None for n in ("prior", "posterior") for p in getattr(m, n).parameters())
+
+
+def test_deterministic_is_deterministic_in_eval():
+    m, b = _model(deterministic=True), _batch()
+    m.eval()
+    torch.manual_seed(1); g1 = m(b["images"], b["actions"], b["speed"], N_PRED)["green"]
+    torch.manual_seed(2); g2 = m(b["images"], b["actions"], b["speed"], N_PRED)["green"]
+    assert torch.equal(g1, g2)
+
+
+def test_warm_start_reproduces_stage_one_exactly():
+    """Stage 2 starts where stage 1 ended: with P_z's weight at 0, any z gives the deterministic prediction."""
+    det, b = _model(deterministic=True), _batch()
+    for p in det.parameters():                                       # pretend stage 1 trained: perturb every weight
+        p.data.add_(0.01 * torch.randn_like(p))
+    torch.manual_seed(7)
+    sto = WorldModel(WMConfig(n_cond=N_COND))
+    copied = sto.load_warm_start(det.state_dict())
+    assert not any(k.startswith(("prior.", "posterior.", "P_z.")) for k in copied)
+    det.eval(); sto.eval()
+    g_det = det(b["images"], b["actions"], b["speed"], N_PRED)["green"]
+    for src in ("prior", "post"):
+        g = sto(b["images"], b["actions"], b["speed"], N_PRED, z_source=src)["green"]
+        assert torch.allclose(g, g_det, atol=1e-6), src
+    assert sto.P_z.weight.abs().sum() == 0
 
 
 if __name__ == "__main__":

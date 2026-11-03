@@ -17,6 +17,18 @@ Adding an encoder: implement it in `models/encoders.py`, register it in `build_e
 Parameter counts are written to `runs/<run>/params.json`. If `vit` wins, also run a ViT with about the CNN's
 parameter count before claiming architecture is the reason.
 
+## Two-stage training (current recipe for the CNN run)
+
+```bash
+# stage 1: deterministic world model (the conditional mean)
+sbatch --export=ALL,ENCODER=cnn,RUN=cnn_det,STEPS=10000,WANDB=1,EXTRA_ARGS="--deterministic" scripts/hpc/train_wm.sbatch
+# stage 2: stochastic, warm-started from stage 1
+sbatch --export=ALL,ENCODER=cnn,RUN=cnn_ws,STEPS=10000,WANDB=1,EXTRA_ARGS="--init_from runs/cnn_det/best.pt --beta 1e-4" scripts/hpc/train_wm.sbatch
+```
+
+Stage 1 should already beat empty and warp and keep green mass near 1 (blurry but complete). If it fades too,
+the problem is in Pred/Dec, not in z. Stage 2 should improve on stage 1 without a large posterior/prior gap.
+
 ## Order and gate
 
 1. `cnn` first, alone. Gate before anyone trains `vit` / `vit_mae`: beats predict-empty and warp-previous at
@@ -36,6 +48,17 @@ parameter count before claiming architecture is the reason.
 | std@k | mean prior sigma | not collapsing to ~0; larger in uncertain scenes |
 | act_sens | mean change in prediction when future actions are swapped (speeds re-integrated) | clearly above 0 |
 | samples_*.png | rows: truth, 3 prior samples, prior sigma map (white = sigma >= 1.5) | cars stay sharp; samples differ where the future is uncertain |
+
+## Looking at the predictions
+
+```bash
+python scripts/inspect_wm.py --ckpt runs/<run>/best.pt --cache $C          # 6 val scenes with traffic
+```
+
+Writes `runs/<run>/inspect_<step>/scene_<idx>.png` (+ `.gif`, `summary.csv`): truth, posterior, K prior samples,
+their mean and spread, and brake / speed-up counterfactuals. The script's docstring maps each visual pattern to a
+cause (z too weak, z ignored under the prior, prior cannot produce the right z, drift over the horizon, actions
+ignored). The images are rendered rounD data: keep them local.
 
 ## Budget
 

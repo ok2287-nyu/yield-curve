@@ -27,6 +27,14 @@ The forward value is unchanged, so Pred/Dec still learn to cope with prior sampl
 sigma_p -> 0 through the reparameterisation; the prior head is trained by the KL alone (as in SVG-LP).
 --no-prior_sg turns it off for the ablation. It applies only to z_source="mix" (training); imagination is
 unaffected because there the world model is frozen anyway.
+
+Two-stage training (PPUU's warm start, Oct 24 / Nov 3):
+    stage 1  deterministic=True: z is always 0, the prior/posterior heads are never run, there is no KL and no future
+             frame is encoded. Every step is open loop in h, so MSE gives the conditional mean (blurry, but with the
+             right expected amount of car) and exposure bias cannot arise.
+    stage 2  a stochastic model initialised from stage 1 with `load_warm_start`: everything except the prior,
+             posterior and P_z is copied, and P_z starts at ZERO, so at step 0 the stochastic model reproduces the
+             deterministic one exactly and z can only add what the mean could not predict.
 """
 from __future__ import annotations
 
@@ -52,6 +60,7 @@ class WMConfig:
     p_zdrop: float = 0.5        # probability of sampling z from the prior on a training step
     beta: float = 1e-6          # KL weight, relative to a per-pixel MEAN squared error
     prior_sg: bool = True       # stop-gradient on prior samples during z-dropout training
+    deterministic: bool = False  # stage 1: z = 0 always, no prior/posterior, no KL
     logvar_min: float = -8.0
     logvar_max: float = 6.0
 
@@ -190,6 +199,7 @@ class WorldModel(nn.Module):
                  "post"  always the posterior (diagnostic: how well z can explain the future)
                  "prior" always the prior (open-loop evaluation, imagination)
                  "given" z_seq[k] (B, z_ch, 8, 8) at rollout step k (e.g. one z shared across dropout masks)
+                 "zero"  z = 0 at every step (forced when cfg.deterministic)
         Returns dict:
             green        (B, n_pred, 1, 64, 64)  predicted frames n_cond .. n_cond+n_pred-1
             green_warm   (B, n_cond, 1, 64, 64)  warm-up reconstructions of frames 0 .. n_cond-1
@@ -199,6 +209,8 @@ class WorldModel(nn.Module):
             z            (n_pred, B, z_ch, 8, 8) the latents used (detached), for reuse via z_source="given"
         """
         n, cfg = self.cfg.n_cond, self.cfg
+        if cfg.deterministic:
+            z_source = "zero"                       # whatever was asked: a deterministic model has no z
         use_post = z_source in ("mix", "post")
         T_enc = n + n_pred if use_post else n
         e = self.encode(images[:, :T_enc])
@@ -210,6 +222,14 @@ class WorldModel(nn.Module):
         B = h.shape[0]
         for k in range(n_pred):
             i = n - 1 + k                                                          # current frame; predict i+1
+            if z_source == "zero":                  # deterministic: no heads run, z = 0 (P_z(0) = its bias only)
+                z = torch.zeros(B, cfg.z_ch, 8, 8, device=h.device)
+                u = self.P_z(z.to(h.dtype)) + self.action_map(actions[:, i], speeds[:, i])
+                h = self.pred(h, u)
+                greens.append(self.decode(h))
+                stds.append(torch.zeros(B, device=h.device)); std_maps.append(torch.zeros(B, 8, 8, device=h.device))
+                zs.append(z)
+                continue
             mu_p, lv_p = self.prior(h)
             if use_post:
                 mu_q, lv_q = self.posterior(torch.cat([h, e[:, i + 1]], 1))
@@ -246,10 +266,26 @@ class WorldModel(nn.Module):
         tgt = imgs[:, n:n + n_pred, GREEN:GREEN + 1]
         mse_t = ((out["green"].float() - tgt) ** 2).mean((0, 2, 3, 4))           # per rollout step
         mse_warm = ((out["green_warm"].float() - imgs[:, :n, GREEN:GREEN + 1]) ** 2).mean()
-        kl_t = out["kl"].mean(0)
-        loss = mse_t.mean() + mse_warm + self.cfg.beta * kl_t.mean()
+        kl = out["kl"].mean() if out["kl"] is not None else torch.zeros((), device=mse_t.device)
+        loss = mse_t.mean() + mse_warm + self.cfg.beta * kl
         return loss, {"loss": loss.item(), "mse": mse_t.mean().item(), "mse_warm": mse_warm.item(),
-                      "kl": kl_t.mean().item(), "prior_std": out["prior_std"].mean().item()}
+                      "kl": kl.item(), "prior_std": out["prior_std"].mean().item()}
+
+    # ---- stage 2 initialisation ----------------------------------------------------------------------------------
+    FRESH = ("prior.", "posterior.", "P_z.")
+
+    def load_warm_start(self, state_dict):
+        """Copy a (deterministic) stage-1 model into this one, except the prior, posterior and P_z, which start
+        fresh; P_z starts at zero so the first forward pass equals the stage-1 model's. Returns the copied keys."""
+        own = self.state_dict()
+        keep = {k: v for k, v in state_dict.items() if not k.startswith(self.FRESH) and k in own}
+        missing = [k for k in own if not k.startswith(self.FRESH) and k not in keep]
+        if missing:
+            raise KeyError(f"warm start checkpoint lacks {missing[:5]} ... (different encoder or sizes?)")
+        self.load_state_dict(keep, strict=False)
+        with torch.no_grad():
+            self.P_z.weight.zero_(); self.P_z.bias.copy_(state_dict["P_z.bias"])   # P_z(z) = stage-1's P_z(0)
+        return sorted(keep)
 
     # ---- epistemic helper (for the policy later) ---------------------------------------------------------------
     @contextmanager
