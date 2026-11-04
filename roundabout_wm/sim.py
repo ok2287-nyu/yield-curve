@@ -155,12 +155,13 @@ class ImaginedDrive:
 
     def rollout(self, accel, steps: int):
         """From the current state, `steps` ticks of constant acceleration `accel` (None = the human's) along the human's
-        route. Returns (green (steps, 64, 64), ego poses (steps, 3) = x, y, heading), and leaves the sim at the end."""
-        greens, poses = [], []
+        route. Returns (green (steps, 64, 64), ego poses (steps, 3) = x, y, heading, road (steps, 64, 64)), and leaves
+        the sim at the end."""
+        greens, poses, roads = [], [], []
         for _ in range(steps):
             f = self.step(accel, None)
-            greens.append(f[1]); poses.append(self.state[:3].copy())
-        return torch.stack(greens), torch.tensor(np.array(poses))
+            greens.append(f[1]); poses.append(self.state[:3].copy()); roads.append(f[0])
+        return torch.stack(greens), torch.tensor(np.array(poses)), torch.stack(roads)
 
     # ---- branching --------------------------------------------------------------------------------------------------
     def save(self, name: str):
