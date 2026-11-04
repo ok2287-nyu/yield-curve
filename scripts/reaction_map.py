@@ -2,6 +2,7 @@
 
     python scripts/reaction_map.py --ckpt runs/cnn_det/best.pt --cache ../round_cache --data_dir ../round_data \
         --scene 0 --a brake --b go --seconds 4 --k 8
+    python scripts/reaction_map.py ... --batch 200 --pairs brake:go,brake:coast,coast:go     # many scenes, no pictures
 
 In the ego-centric frames, plan B's picture differs from plan A's mostly because the camera moved with the ego. So B's
 prediction at each step is re-projected into A's ego frame at that step (exact warp by the known pose difference,
@@ -14,6 +15,17 @@ Writes <ckpt dir>/reaction_scene<scene>_<a>_vs_<b>.png with rows:
     A (A's frame) | B (B's frame) | B warped into A's frame | difference (B - A)
 (road dim, ego A blue, plan B's ego as a white outline in the last two rows), and prints per 0.4 s the reaction
     score: mean |B - A| over the shared area, and how much traffic B adds / removes.
+Batch mode (--batch N): N random val scenes with at least one car visible at the last warm-up frame; per plan pair and
+0.4 s it prints the mean over scenes of
+    reaction   gross |B - A| over the comparison area, in cars (1 car = the ego's own area in pixels)
+    net        sum of (B - A) over the same area, in cars: traffic created (+) or deleted (-) by the ego's plan
+    |net|/gross  0 = the difference is all cars MOVING (following, yielding); 1 = all cars appearing / vanishing
+The comparison area is the shared area minus a --margin (pixels) on every side, so cars crossing the crop edge count
+as little as possible. A reaction moves cars, it cannot create or delete them, so |net| is the LEAKAGE: the plan used
+as evidence about traffic ("people go when the ring is clear"). Residual causes of a nonzero net, which bound how
+small it can get: cars moving across the comparison area's border, and a deterministic model's blur changing with
+the plan. Writes <ckpt dir>/reaction_batch.csv (per scene, pair and step) and prints the scenes with the largest
+leakage at 2 s, to look at with single-scene mode.
 Caveat (the research question's core problem): the model learned from logs where human egos chose actions after
 reading the other drivers, so a predicted "reaction" can be correlation, not causation. Read it together with the lag
 (how soon after the actions diverge the difference appears) and only for plausible plans.
@@ -51,6 +63,38 @@ def expected(sim, accel, steps, k, base_seed):
     return torch.stack(gs).mean(0), poses, roads, sim.state[3]
 
 
+@torch.no_grad()
+def compare(sim, scene, plan_a, plan_b, steps, k, seed, margin):
+    """Plan A vs plan B from the same warm-up. Returns a dict with the predictions, poses, roads, B warped into A's
+    frame, the comparison mask and the difference (all (steps, 64, 64) unless noted)."""
+    rc = sim.cfg.render
+    sim.reset(scene, seed=seed); sim.save("start")
+    ego = sim.ego_blue                                                    # the ego's box, same in every frame
+    gA, pA, rA, vA = expected(sim, plan_value(plan_a), steps, k, seed)
+    gB, pB, rB, vB = expected(sim, plan_value(plan_b), steps, k, seed)
+    # B's prediction at step t, re-projected into A's ego frame at step t (one warp per step)
+    warped = warp_previous(gB[:, None], pB, pA[:, None], rc)[:, 0, 0]
+    shared = warp_previous(torch.ones_like(gB)[:, None], pB, pA[:, None], rc)[:, 0, 0] > 0.999
+    # drop a rim of `margin` pixels (at least 1: B's own crop edge lands there after the warp, interpolated against
+    # the zero padding), on the shared area's border and on the image border
+    m = max(1, margin)
+    core = shared.float().clone()
+    core[:, :m] = 0; core[:, -m:] = 0; core[:, :, :m] = 0; core[:, :, -m:] = 0
+    core = -torch.nn.functional.max_pool2d(-core[:, None], 2 * m + 1, 1, m)[:, 0] > 0.5
+    diff = (warped - gA) * core
+    egoB_in_A = warp_previous(ego.expand(steps, 1, 64, 64).clone(), pB, pA[:, None], rc)[:, 0, 0] > 0.5
+    return dict(gA=gA, gB=gB, rA=rA, rB=rB, vA=vA, vB=vB, warped=warped, core=core, diff=diff, ego=ego,
+                egoB_in_A=egoB_in_A, car=float(ego.sum()))
+
+
+def scores(c):
+    """Per step: reaction (gross |B-A|) and net (B-A), both in cars, and the comparison area's share of the image."""
+    car = max(c["car"], 1e-6)
+    gross = c["diff"].abs().sum((1, 2)) / car
+    net = c["diff"].sum((1, 2)) / car
+    return gross, net, c["core"].float().mean((1, 2))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
@@ -63,38 +107,82 @@ def main():
     p.add_argument("--seconds", type=float, default=4.0)
     p.add_argument("--k", type=int, default=8, help="prior samples averaged per plan (stochastic models)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--margin", type=int, default=4, help="pixels dropped at the comparison area's border (4 = 3 m)")
+    p.add_argument("--batch", type=int, default=0, help="N > 0: N random scenes, summary numbers, no picture")
+    p.add_argument("--pairs", default="brake:go", help="batch mode: plan pairs A:B, comma-separated")
     p.add_argument("--out", default=None)
     a = p.parse_args()
 
     sim = ImaginedDrive.load(a.ckpt, a.cache, a.data_dir, a.split)
-    rc, dt = sim.cfg.render, sim.cfg.data.dt
+    dt = sim.cfg.data.dt
     steps = int(round(a.seconds / dt))
     k = 1 if sim.model.cfg.deterministic else a.k
-    sim.reset(a.scene, seed=a.seed); sim.save("start")
-    ego = sim.ego_blue                                                    # the ego's box, same in every frame
-    gA, pA, rA, vA = expected(sim, plan_value(a.a), steps, k, a.seed)
-    gB, pB, rB, vB = expected(sim, plan_value(a.b), steps, k, a.seed)
+    kind = "deterministic" if k == 1 else f"mean of {k} prior samples"
+    if a.batch > 0:
+        return batch(sim, a, steps, k, kind)
 
-    # B's prediction at step t, re-projected into A's ego frame at step t (one warp per step)
-    warped = warp_previous(gB[:, None], pB, pA[:, None], rc)[:, 0, 0]
-    valid = warp_previous(torch.ones_like(gB)[:, None], pB, pA[:, None], rc)[:, 0, 0] > 0.999
-    # drop a 1-pixel rim: B's own crop edge lands there after the warp (interpolation against the zero padding)
-    valid = -torch.nn.functional.max_pool2d(-valid.float()[:, None], 3, 1, 1)[:, 0] > 0.5
-    diff = (warped - gA) * valid
-    # where plan B's ego is, seen from plan A's ego (drawn as an outline in rows 3 and 4)
-    egoB_in_A = warp_previous(ego.expand(steps, 1, 64, 64).clone(), pB, pA[:, None], rc)[:, 0, 0] > 0.5
-
-    print(f"scene {a.scene} | plan A = {a.a} (ends at {vA:.1f} m/s) | plan B = {a.b} (ends at {vB:.1f} m/s) | "
-          f"{'deterministic' if k == 1 else f'mean of {k} prior samples'}")
-    print(f"{'time':>6s} {'|B-A| (shared area)':>20s} {'B adds':>9s} {'B removes':>10s} {'shared area':>12s}")
+    c = compare(sim, a.scene, a.a, a.b, steps, k, a.seed, a.margin)
+    gross, net, area = scores(c)
+    print(f"scene {a.scene} | plan A = {a.a} (ends at {c['vA']:.1f} m/s) | plan B = {a.b} (ends at {c['vB']:.1f} m/s)"
+          f" | {kind} | 1 car = {c['car']:.1f} px")
+    print(f"{'time':>6s} {'reaction (cars)':>16s} {'net (cars)':>11s} {'|net|/gross':>12s} {'area':>6s}")
     for t in range(1, steps, 2):
-        m = valid[t].float().sum().clamp_min(1)
-        print(f"{(t + 1) * dt:5.1f}s {diff[t].abs().sum() / m:20.5f} {diff[t].clamp(min=0).sum():9.2f} "
-              f"{(-diff[t]).clamp(min=0).sum():10.2f} {valid[t].float().mean():11.0%}")
+        print(f"{(t + 1) * dt:5.1f}s {gross[t]:16.2f} {net[t]:11.2f} {abs(net[t]) / max(gross[t], 1e-6):12.2f} "
+              f"{area[t]:6.0%}")
+    draw(c, a, steps, dt)
 
+
+def batch(sim, a, steps, k, kind):
+    import csv
+    pairs = [tuple(x.split(":")) for x in a.pairs.split(",")]
+    n = sim.cfg.data.n_cond
+    rng = np.random.default_rng(a.seed)
+    scenes, tried = [], 0
+    for i in rng.permutation(len(sim.ds)):                 # scenes with at least one car in the last warm-up frame
+        tried += 1
+        it = sim.ds[int(i)]
+        if it["images"][n - 1, 1].sum() >= it["images"][n - 1, 2].sum():
+            scenes.append(int(i))
+        if len(scenes) == a.batch:
+            break
+    print(f"{len(scenes)} scenes with traffic (of {tried} drawn) | {kind} | margin {a.margin} px | pairs {a.pairs}")
+    out = a.out or os.path.join(os.path.dirname(a.ckpt), "reaction_batch.csv")
+    rows, worst = [], {}
+    for j, sc in enumerate(scenes):
+        for pa, pb in pairs:
+            c = compare(sim, sc, pa, pb, steps, k, a.seed, a.margin)
+            gross, net, area = scores(c)
+            for t in range(steps):
+                rows.append(dict(scene=sc, a=pa, b=pb, time_s=round((t + 1) * sim.cfg.data.dt, 2),
+                                 reaction=gross[t].item(), net=net[t].item(), area=area[t].item()))
+            worst.setdefault((pa, pb), []).append((abs(net[9].item()), sc))
+        if (j + 1) % 25 == 0:
+            print(f"  {j + 1}/{len(scenes)} scenes")
+    with open(out, "w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=list(rows[0].keys())); wr.writeheader(); wr.writerows(rows)
+
+    import pandas as pd
+    d = pd.DataFrame(rows)
+    d["abs_net"] = d.net.abs()
+    for (pa, pb), g in d.groupby(["a", "b"], sort=False):
+        print(f"\n{pa} vs {pb}: mean over {g.scene.nunique()} scenes (cars; 1 car = the ego's area)")
+        print(f"{'time':>6s} {'reaction':>9s} {'net':>7s} {'|net|':>7s} {'|net|/reaction':>15s} {'area':>6s}")
+        for t, h in g.groupby("time_s"):
+            if round(t / sim.cfg.data.dt) % 2:
+                continue
+            r, nt, an = h.reaction.mean(), h.net.mean(), h.abs_net.mean()
+            print(f"{t:5.1f}s {r:9.2f} {nt:7.2f} {an:7.2f} {an / max(r, 1e-6):15.2f} {h.area.mean():6.0%}")
+        top = sorted(worst[(pa, pb)], reverse=True)[:5]
+        print("  largest |net| at 2 s: " + ", ".join(f"scene {sc} ({v:.1f})" for v, sc in top))
+    print(f"wrote {out}")
+
+
+def draw(c, a, steps, dt):
+    gA, gB, rA, rB, warped, diff, ego, egoB_in_A = (c[x] for x in ("gA", "gB", "rA", "rB", "warped", "diff", "ego",
+                                                                   "egoB_in_A"))
     # picture: columns every 0.4 s; rows A, B, B in A's frame, difference. Rows 1-3 in the training colours (road dim
-    # red, others green, ego blue). Row 4: road dim grey, ego A blue, difference red/green. White outline = plan B's
-    # ego, seen from plan A's ego (rows 3 and 4).
+    # red, others green, ego blue). Row 4: road dim grey, ego A blue, difference red/green (only inside the
+    # comparison area). White outline = plan B's ego, seen from plan A's ego (rows 3 and 4).
     S, cols = 4, list(range(1, steps, 2))
     def outline(mask):
         m = mask.float()[None, None]
