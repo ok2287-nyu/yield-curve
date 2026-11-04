@@ -47,7 +47,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cache", required=True)
     p.add_argument("--det", required=True, help="deterministic (stage-1) checkpoint")
-    p.add_argument("--stoch", nargs="+", required=True, help="stochastic checkpoints to compare")
+    p.add_argument("--stoch", nargs="+", required=True,
+                   help="stochastic checkpoints to compare (use last.pt: best.pt is chosen by lowest MSE, which "
+                        "favours the least stochastic checkpoint)")
     p.add_argument("--scenes", type=int, nargs="+", default=[0, 72, 145, 218, 290, 363])
     p.add_argument("--k", type=int, default=4, help="prior samples per stochastic model")
     p.add_argument("--split", default="val")
@@ -95,6 +97,7 @@ def main():
         for name, m, _, _ in stochs:
             torch.manual_seed(a.seed)
             post = m(imgs, act, spd, T, z_source="post")["green"][0].float().cpu()
+            post_mse = ((post - tg) ** 2).mean((1, 2, 3))
             rows.append(to_img(sel(compose(post, road, ego)))); labels.append(f"{name} post")
             samples = []
             for j in range(a.k):
@@ -106,14 +109,17 @@ def main():
             sp = (S.std(0) / 0.25).clamp(0, 1).expand(-1, 3, -1, -1)       # fixed scale: std 0.25 = white
             rows.append(to_img(sel(sp))); labels.append(f"{name} spread")
             report[(idx, name)] = numbers(S)
+            report[(idx, name)]["post"] = {k: post_mse[k - 1].item() for k in (5, 20)}
         labelled_grid(rows, labels, col_times).save(os.path.join(a.out_dir, f"compare_{idx}.png"))
 
-    print(f"\nper scene: mass ratio / spread / MSE of mean-of-{a.k} / MSE of best-of-{a.k}   at 1 s | 4 s")
+    print(f"\nper scene: mass ratio / spread / MSE of mean-of-{a.k} / MSE of best-of-{a.k} / MSE of the posterior"
+          f"   at 1 s | 4 s")
     for idx in a.scenes:
         print(f"scene {idx}")
         for nm in ["deterministic"] + [s[0] for s in stochs]:
             r = report[(idx, nm)]
-            cell = lambda k: f"m{r[k][0]:4.2f} s{r[k][1]:.4f} mean {r[k][2]:.4f} best {r[k][3]:.4f}"
+            post = lambda k: f" post {r['post'][k]:.4f}" if "post" in r else ""
+            cell = lambda k: f"m{r[k][0]:4.2f} s{r[k][1]:.4f} mean {r[k][2]:.4f} best {r[k][3]:.4f}{post(k)}"
             print(f"  {nm:14s} 1 s: {cell(5)} | 4 s: {cell(20)}")
     print(f"wrote {len(a.scenes)} sheets to {a.out_dir}/")
 
