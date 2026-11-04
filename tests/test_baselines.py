@@ -32,6 +32,20 @@ def test_yaw_rate_wraps():
     assert np.isclose(yaw_rate(np.pi - 0.05, -np.pi + 0.05, 0.4), -0.1 / 0.4)
 
 
+
+def test_blur_keeps_mass_and_identity():
+    import importlib.util, os
+    spec = importlib.util.spec_from_file_location("eb", os.path.join(os.path.dirname(__file__), "..", "scripts",
+                                                                     "eval_baselines.py"))
+    eb = importlib.util.module_from_spec(spec); spec.loader.exec_module(eb)
+    x = np.zeros((2, 64, 64), np.float32); x[:, 30:34, 28:36] = 1.0
+    assert np.array_equal(eb.blur(x, 0), x)
+    for sg in (0.5, 2.0, 4.0):
+        y = eb.blur(x, sg)
+        assert y.shape == x.shape and np.isclose(y.sum(), x.sum(), rtol=1e-4)   # interior: mass kept
+        assert y.max() < x.max()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

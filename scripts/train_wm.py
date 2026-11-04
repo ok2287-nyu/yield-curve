@@ -69,6 +69,9 @@ def args_():
                    help="stage 1: no z, no prior/posterior, no KL (the model learns the conditional mean)")
     p.add_argument("--pz_init_scale", type=float, default=0.0,
                    help="stage 2: P_z weight = this x default init (0 = exact stage-1 start, but see load_warm_start)")
+    p.add_argument("--best_metric", choices=["auto", "prior", "elbo"], default="auto",
+                   help="what best.pt minimises: auto = prior MSE for deterministic runs, validation ELBO for "
+                        "stochastic runs (see selection_score)")
     p.add_argument("--kl_warmup_steps", type=int, default=0,
                    help="beta = 0 for this many steps, then a linear ramp to --beta over the same number of steps")
     p.add_argument("--init_from", default=None,
@@ -134,6 +137,21 @@ def loaders(a, cfg):
     val_loader = DataLoader(va, shuffle=True, generator=torch.Generator().manual_seed(VAL_SEED), **kw)
     stats = stats or {"speed_mean": 0.0, "speed_std": 1.0, "action_mean": [0.0, 0.0], "action_std": [1.0, 1.0]}
     return DataLoader(tr, shuffle=True, generator=g, **kw), val_loader, len(tr), len(va), stats
+
+
+def selection_score(v, a, deterministic: bool) -> float:
+    """What best.pt minimises on validation.
+    deterministic (or --best_metric prior): the open-loop prior MSE, averaged over the horizon.
+    stochastic   (--best_metric elbo, the default for stochastic runs): the validation negative ELBO with the run's
+                 final beta, i.e. posterior MSE + warm-up MSE + beta * KL. The prior MSE is the wrong criterion for a
+                 stochastic model: a single sample is supposed to be worse than the mean, so the lowest prior MSE
+                 picks the least stochastic checkpoint (ws_both: step 1,000 of 10,000). The ELBO rewards z that
+                 explains the future (low posterior MSE) only as far as the prior can match it (KL), and is not
+                 lowered by collapse."""
+    metric = a.best_metric if a.best_metric != "auto" else ("prior" if deterministic else "elbo")
+    if metric == "prior":
+        return v["prior"].mean().item()
+    return (v["post"].mean() + v["mse_warm"] + a.beta * v["kl"].mean()).item()
 
 
 def beta_at(step: int, a) -> float:
@@ -239,7 +257,7 @@ def gpu_util():
 
 
 LOG_FIELDS = (["step", "split", "loss", "mse", "mse_warm", "kl", "prior_std", "act_sens", "gap_mean", "s_per_step",
-               "gpu_util", "time"]
+               "gpu_util", "time", "elbo"]
               + [f"{m}@{k}" for k in REPORT_STEPS for m in ("prior", "post", "empty", "copy", "warp", "mass", "kl",
                                                              "std", "spread")])
 
@@ -406,7 +424,8 @@ def main():
                 v = validate(model, val_loader, a, dev, cfg, stats)
                 row = {"step": step, "split": "val", "mse": v["prior"].mean().item(), "mse_warm": v["mse_warm"],
                        "kl": v["kl"].mean().item(), "prior_std": v["std"].mean().item(),
-                       "act_sens": v["act_sens"], "gap_mean": v["gap"].mean().item(), "time": time.time()}
+                       "act_sens": v["act_sens"], "gap_mean": v["gap"].mean().item(), "time": time.time(),
+                       "elbo": (v["post"].mean() + v["mse_warm"] + a.beta * v["kl"].mean()).item()}
                 print(f"  VAL (step {step})        " + "  ".join(f"{k * 0.2:.0f}s" .rjust(9) for k in REPORT_STEPS))
                 for name in ("prior", "post", "empty", "copy", "warp", "mass", "spread", "kl", "std"):
                     vals = [v[name][min(k, len(v[name])) - 1].item() for k in REPORT_STEPS]
@@ -424,8 +443,9 @@ def main():
                 wb.log({f"val/{k}": x for k, x in row.items()}, step)
                 wb.curves(v, step, a.n_pred)
                 wb.image(sample_path, step)
-                if v["prior"].mean().item() < best:
-                    best = v["prior"].mean().item()
+                score = selection_score(v, a, wm_cfg.deterministic)
+                if score < best:
+                    best = score
                     save(os.path.join(out_dir, "best.pt"))
 
             if time.time() - last_ckpt > a.ckpt_minutes * 60:
@@ -434,7 +454,7 @@ def main():
                 break
     save(ckpt)
     wb.finish(best)
-    print(f"done at step {step}, best val mse (prior) {best:.5f}")
+    print(f"done at step {step}, best validation score ({'prior MSE' if wm_cfg.deterministic or a.best_metric == 'prior' else a.best_metric if a.best_metric != 'auto' else 'ELBO'}) {best:.5f}")
 
 
 if __name__ == "__main__":

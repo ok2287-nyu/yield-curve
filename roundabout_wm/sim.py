@@ -153,6 +153,15 @@ class ImaginedDrive:
         i = self.cfg.data.n_cond - 1 + self.t
         return self.item["images"][i] if i < self.item["images"].shape[0] else None
 
+    def rollout(self, accel, steps: int):
+        """From the current state, `steps` ticks of constant acceleration `accel` (None = the human's) along the human's
+        route. Returns (green (steps, 64, 64), ego poses (steps, 3) = x, y, heading), and leaves the sim at the end."""
+        greens, poses = [], []
+        for _ in range(steps):
+            f = self.step(accel, None)
+            greens.append(f[1]); poses.append(self.state[:3].copy())
+        return torch.stack(greens), torch.tensor(np.array(poses))
+
     # ---- branching --------------------------------------------------------------------------------------------------
     def save(self, name: str):
         self._saved[name] = {"h": self.h.clone(), "state": self.state.copy(), "t": self.t, "s": self.s,

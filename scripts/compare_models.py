@@ -48,8 +48,8 @@ def main():
     p.add_argument("--cache", required=True)
     p.add_argument("--det", required=True, help="deterministic (stage-1) checkpoint")
     p.add_argument("--stoch", nargs="+", required=True,
-                   help="stochastic checkpoints to compare (use last.pt: best.pt is chosen by lowest MSE, which "
-                        "favours the least stochastic checkpoint)")
+                   help="stochastic checkpoints to compare (best.pt for runs trained after best.pt was chosen by "
+                        "ELBO; last.pt for older runs, whose best.pt favours the least stochastic checkpoint)")
     p.add_argument("--scenes", type=int, nargs="+", default=[0, 72, 145, 218, 290, 363])
     p.add_argument("--k", type=int, default=4, help="prior samples per stochastic model")
     p.add_argument("--split", default="val")
