@@ -265,6 +265,39 @@ def test_open_loop_sequences_never_use_the_posterior():
     assert not torch.equal(h1, h2)
 
 
+def _masks_drawn_per_module(per_sequence):
+    """Train-mode forward pass; count how many distinct dropout masks each StickyDropout2d used."""
+    m, b = _model(), _batch()
+    m.train()
+    seen = {}
+    mods = [d for d in m.modules() if isinstance(d, StickyDropout2d)]
+    orig = StickyDropout2d.forward
+
+    def spy(self, x):
+        y = orig(self, x)
+        if self.training and self.p > 0:
+            key = id(self.mask) if self.sticky else object()      # non-sticky: a fresh mask every call
+            seen.setdefault(id(self), set()).add(key if self.sticky else id(key))
+        return y
+    StickyDropout2d.forward = spy
+    try:
+        if per_sequence:
+            with m.fixed_dropout_masks():
+                m.loss(b, N_PRED)
+        else:
+            m.loss(b, N_PRED)
+    finally:
+        StickyDropout2d.forward = orig
+    return [len(seen[id(d)]) for d in mods]
+
+
+def test_per_sequence_masks_in_training():
+    """Decided Nov 4: in training each sequence keeps one dropout mask per layer for all steps (as in the epistemic
+    estimate). Per-step mode draws a new one every call."""
+    assert all(n == 1 for n in _masks_drawn_per_module(per_sequence=True))
+    assert all(n > 1 for n in _masks_drawn_per_module(per_sequence=False))
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
