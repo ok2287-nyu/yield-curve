@@ -67,6 +67,17 @@ but their prior samples are worse than the deterministic mean (prior/empty 1 s ~
 | act_sens | mean change in prediction when future actions are swapped (speeds re-integrated) | clearly above 0 |
 | samples_*.png | rows: truth, 3 prior samples, prior sigma map (white = sigma >= 1.5) | cars stay sharp; samples differ where the future is uncertain |
 
+## Baselines on the same windows (incl. constant velocity / constant turn rate)
+
+```bash
+python scripts/eval_baselines.py --cache ../round_cache --data_dir ../round_data --ckpt runs/cnn_det/best.pt
+```
+
+Empty, copy, warp, constant velocity (cv) and constant turn rate (ctrv) — plus the model if `--ckpt` is given — all
+on the same random 3,000 val windows (`--n_windows 0` = all): MSE, MSE/empty and green mass at 1 / 2 / 4 s. cv/ctrv
+extrapolate only road users seen in the crop during warm-up. Beating ctrv is the evidence that the model learned
+behaviour (braking, yielding, gap acceptance) and not just inertia. CPU, ~10-20 min.
+
 ## Field of view: vehicles the model could not have seen
 
 ```bash
