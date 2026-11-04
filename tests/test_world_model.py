@@ -204,6 +204,46 @@ def test_warm_start_reproduces_stage_one_exactly():
     assert sto.P_z.weight.abs().sum() == 0
 
 
+def _stage2(pz_init_scale):
+    det = _model(deterministic=True)
+    for p in det.parameters():
+        p.data.add_(0.01 * torch.randn_like(p))
+    torch.manual_seed(7)
+    sto = WorldModel(WMConfig(n_cond=N_COND, beta=0.0, p_zdrop=0.0))     # posterior steps only, no KL
+    sto.load_warm_start(det.state_dict(), pz_init_scale=pz_init_scale)
+    return det, sto
+
+
+def test_zero_pz_blocks_the_mse_gradient_into_the_posterior():
+    """The trap seen in run cnn_ws: with P_z's weight at 0, the MSE sends exactly no gradient to the posterior,
+    so only the KL trains it (and collapses it onto the prior). A small random P_z opens the path."""
+    for scale, expect_zero in ((0.0, True), (0.01, False)):
+        _, sto = _stage2(scale)
+        loss, _ = sto.loss(_batch(), N_PRED)
+        loss.backward()
+        g = sum(float(p.grad.abs().sum()) for p in sto.posterior.parameters() if p.grad is not None)
+        assert (g == 0.0) == expect_zero, (scale, g)
+
+
+def test_small_pz_start_stays_close_to_stage_one():
+    det, sto = _stage2(0.01)
+    det.eval(); sto.eval()
+    b = _batch()
+    g_det = det(b["images"], b["actions"], b["speed"], N_PRED)["green"]
+    g = sto(b["images"], b["actions"], b["speed"], N_PRED, z_source="prior")["green"]
+    assert (g - g_det).abs().max() < 0.05 and not torch.equal(g, g_det)
+
+
+def test_beta_schedule():
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    from train_wm import beta_at
+    A = type("A", (), {"beta": 1e-4, "kl_warmup_steps": 1000})
+    assert beta_at(0, A) == 0 and beta_at(999, A) == 0
+    assert abs(beta_at(1500, A) - 5e-5) < 1e-12 and beta_at(2000, A) == 1e-4 and beta_at(9000, A) == 1e-4
+    A.kl_warmup_steps = 0
+    assert beta_at(0, A) == 1e-4
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

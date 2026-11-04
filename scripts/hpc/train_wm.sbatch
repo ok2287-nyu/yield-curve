@@ -32,5 +32,5 @@ if [ -n "${WANDB:-}" ]; then
   ARGS="$ARGS --wandb"
   if [ "$WANDB" = "offline" ]; then export WANDB_MODE=offline; fi
 fi
-python scripts/train_wm.py --cache "$ROOT/round_cache" --encoder "${ENCODER:-cnn}" --run "${RUN:-cnn}" \
+python -u scripts/train_wm.py --cache "$ROOT/round_cache" --encoder "${ENCODER:-cnn}" --run "${RUN:-cnn}" \
   --workers 10 $ARGS

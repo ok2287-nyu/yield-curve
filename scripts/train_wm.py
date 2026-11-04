@@ -66,6 +66,10 @@ def args_():
     p.add_argument("--init_encoder", default=None, help="MAE-pretrained encoder weights (vit only)")
     p.add_argument("--deterministic", action="store_true",
                    help="stage 1: no z, no prior/posterior, no KL (the model learns the conditional mean)")
+    p.add_argument("--pz_init_scale", type=float, default=0.0,
+                   help="stage 2: P_z weight = this x default init (0 = exact stage-1 start, but see load_warm_start)")
+    p.add_argument("--kl_warmup_steps", type=int, default=0,
+                   help="beta = 0 for this many steps, then a linear ramp to --beta over the same number of steps")
     p.add_argument("--init_from", default=None,
                    help="stage 2: warm-start from a stage-1 checkpoint (prior, posterior, P_z start fresh)")
     p.add_argument("--enc_lr_mult", type=float, default=None,
@@ -123,6 +127,14 @@ def loaders(a, cfg):
     val_loader = DataLoader(va, shuffle=True, generator=torch.Generator().manual_seed(VAL_SEED), **kw)
     stats = stats or {"speed_mean": 0.0, "speed_std": 1.0, "action_mean": [0.0, 0.0], "action_std": [1.0, 1.0]}
     return DataLoader(tr, shuffle=True, generator=g, **kw), val_loader, len(tr), len(va), stats
+
+
+def beta_at(step: int, a) -> float:
+    """KL weight at a training step: 0 for kl_warmup_steps, then a linear ramp to a.beta over kl_warmup_steps."""
+    w = a.kl_warmup_steps
+    if w <= 0 or step >= 2 * w:
+        return a.beta
+    return 0.0 if step < w else a.beta * (step - w) / w
 
 
 def to(batch, dev):
@@ -323,9 +335,9 @@ def main():
             print(f"WARNING: {a.init_from} is not a deterministic (stage-1) checkpoint")
         if src["wm_cfg"]["encoder"] != a.encoder:
             raise ValueError(f"--init_from has encoder {src['wm_cfg']['encoder']}, this run {a.encoder}")
-        copied = model.load_warm_start(src["model"])
+        copied = model.load_warm_start(src["model"], pz_init_scale=a.pz_init_scale)
         print(f"warm start from {a.init_from} (step {src['step']}): {len(copied)} tensors copied; "
-              f"prior, posterior, P_z fresh (P_z weight = 0)")
+              f"prior, posterior, P_z fresh (P_z weight = {a.pz_init_scale} x default init)")
     elif a.init_encoder:
         assert a.encoder == "vit", "MAE weights only fit the vit encoder"
         model.encoder.load_state_dict(torch.load(a.init_encoder, map_location=dev))
@@ -356,7 +368,7 @@ def main():
         for b in train_loader:
             b = to(b, dev)
             with torch.autocast(dev, dtype=torch.bfloat16, enabled=use_amp):
-                loss, logs = model.loss(b, a.n_pred)
+                loss, logs = model.loss(b, a.n_pred, beta=beta_at(step, a))
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss at step {step}: {logs}")
             opt.zero_grad(set_to_none=True)
@@ -372,7 +384,7 @@ def main():
                 m = {k: run[k] / run_n for k in keys}
                 sps = (time.time() - t0) / run_n
                 gu = gpu_util()
-                print(f"step {step} | loss {m['loss']:.5f} mse {m['mse']:.5f} warm {m['mse_warm']:.5f} "
+                print(f"step {step} | beta {beta_at(step, a):.1e} | loss {m['loss']:.5f} mse {m['mse']:.5f} warm {m['mse_warm']:.5f} "
                       f"kl {m['kl']:.1f} prior_std {m['prior_std']:.3f} | {sps:.3f} s/step gpu {gu}%")
                 log.writerow({"step": step, "split": "train", **m, "s_per_step": sps, "gpu_util": gu,
                               "time": time.time()})
