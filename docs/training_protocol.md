@@ -193,6 +193,19 @@ yielding (red ahead of it) or going (green) depending on the ego's plan. Caveat:
 human ego reacted to others, so a difference can be correlation; look at whether it appears only after the plans
 diverge, and only on cars that interact with the ego.
 
+**Many scenes at once** (no pictures; ~5 min on CPU for the deterministic model, ~8x that for a stochastic one):
+
+```bash
+python scripts/reaction_map.py --ckpt runs/cnn_det/best.pt --cache ../round_cache --data_dir ../round_data \
+    --batch 200 --pairs brake:go,brake:coast,coast:go
+```
+
+Per pair and 0.4 s: `reaction` (how much the predicted traffic changes with the plan, in cars), `net` (traffic
+created + or deleted - by the plan, in cars) and `|net|/reaction` (0 = cars only move: following, yielding;
+1 = cars only appear or vanish). A plan can move other cars but cannot create or delete them, so `|net|` is the
+leakage: the plan used as evidence about the traffic. It ends with the five scenes with the most leakage at 2 s:
+look at those with the single-scene command.
+
 Known limitation, not a model failure: road users that enter the 48 m crop after the 2 s warm-up (the model never saw
 them) are missing from every row except the posterior and the truth. At 4 s this is ~43% of the true car area (see
 `scripts/fov_popin.py`). Scene 363 is an example.
