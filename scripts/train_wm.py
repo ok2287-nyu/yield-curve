@@ -32,6 +32,7 @@ kept in runs/<run>/wandb_id.txt, so a requeued job continues the same W&B run. I
 internet, run with WANDB_MODE=offline and later `wandb sync runs/<run>/wandb/offline-run-*` from a login node.
 """
 import argparse
+import contextlib
 import csv
 import json
 import os
@@ -84,6 +85,10 @@ def args_():
     p.add_argument("--p_openloop", type=float, default=0.0,
                    help="share of training sequences that use prior z at every step (tests exposure bias)")
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--dropout_masks", choices=["sequence", "step"], default="sequence",
+                   help="sequence: each training sequence draws its dropout masks once and keeps them for all 30 "
+                        "steps, the same regime as the epistemic estimate (decided Nov 4); step: a new mask at "
+                        "every step (PPUU; used by all runs before Nov 4)")
     p.add_argument("--prior_sg", action=argparse.BooleanOptionalAction, default=True,
                    help="stop-gradient on prior samples in z-dropout training (--no-prior_sg for the ablation)")
     p.add_argument("--steps", type=int, default=60000, help="set after timing the first run; same for all runs")
@@ -370,7 +375,8 @@ def main():
     while step < a.steps:
         for b in train_loader:
             b = to(b, dev)
-            with torch.autocast(dev, dtype=torch.bfloat16, enabled=use_amp):
+            masks = model.fixed_dropout_masks() if a.dropout_masks == "sequence" else contextlib.nullcontext()
+            with masks, torch.autocast(dev, dtype=torch.bfloat16, enabled=use_amp):
                 loss, logs = model.loss(b, a.n_pred, beta=beta_at(step, a))
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss at step {step}: {logs}")
