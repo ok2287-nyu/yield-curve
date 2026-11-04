@@ -29,6 +29,19 @@ sbatch --export=ALL,ENCODER=cnn,RUN=cnn_ws,STEPS=10000,WANDB=1,EXTRA_ARGS="--ini
 Stage 1 should already beat empty and warp and keep green mass near 1 (blurry but complete). If it fades too,
 the problem is in Pred/Dec, not in z. Stage 2 should improve on stage 1 without a large posterior/prior gap.
 
+### Stage-2 ablation (Nov 4): why z collapsed, one change per run
+
+Run `cnn_ws` (P_z weight 0, no warm-up, beta 1e-4) collapsed: KL ~0.01 nats, posterior = prior, spread ~0.0002.
+With P_z = 0 the MSE gradient into the posterior is exactly zero, so only the KL trains it.
+
+| run | --pz_init_scale | --kl_warmup_steps | --beta |
+|---|---|---|---|
+| cnn_ws (control) | 0 | 0 | 1e-4 |
+| ws_pz | 0.01 | 0 | 1e-4 |
+| ws_warm | 0 | 2000 | 1e-4 |
+| ws_b1e-5 | 0 | 0 | 1e-5 |
+| ws_both | 0.01 | 2000 | 1e-4 |
+
 ## Order and gate
 
 1. `cnn` first, alone. Gate before anyone trains `vit` / `vit_mae`: beats predict-empty and warp-previous at

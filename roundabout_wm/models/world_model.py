@@ -258,8 +258,9 @@ class WorldModel(nn.Module):
                 "prior_std": torch.stack(stds, 1).detach(), "prior_std_map": torch.stack(std_maps, 1).detach(),
                 "z": torch.stack(zs, 0)}
 
-    def loss(self, batch, n_pred):
-        """L = mean_t MSE(rollout) + mean_t MSE(warm-up) + beta * mean_t KL; MSE averaged over pixels."""
+    def loss(self, batch, n_pred, beta: float | None = None):
+        """L = mean_t MSE(rollout) + mean_t MSE(warm-up) + beta * mean_t KL; MSE averaged over pixels.
+        `beta` overrides cfg.beta (used by the KL warm-up schedule in train_wm.py)."""
         n = self.cfg.n_cond
         imgs, act, spd = batch["images"], batch["actions"], batch["speed"]
         out = self(imgs, act, spd, n_pred, z_source="mix")
@@ -267,16 +268,21 @@ class WorldModel(nn.Module):
         mse_t = ((out["green"].float() - tgt) ** 2).mean((0, 2, 3, 4))           # per rollout step
         mse_warm = ((out["green_warm"].float() - imgs[:, :n, GREEN:GREEN + 1]) ** 2).mean()
         kl = out["kl"].mean() if out["kl"] is not None else torch.zeros((), device=mse_t.device)
-        loss = mse_t.mean() + mse_warm + self.cfg.beta * kl
+        loss = mse_t.mean() + mse_warm + (self.cfg.beta if beta is None else beta) * kl
         return loss, {"loss": loss.item(), "mse": mse_t.mean().item(), "mse_warm": mse_warm.item(),
                       "kl": kl.item(), "prior_std": out["prior_std"].mean().item()}
 
     # ---- stage 2 initialisation ----------------------------------------------------------------------------------
     FRESH = ("prior.", "posterior.", "P_z.")
 
-    def load_warm_start(self, state_dict):
+    def load_warm_start(self, state_dict, pz_init_scale: float = 0.0):
         """Copy a (deterministic) stage-1 model into this one, except the prior, posterior and P_z, which start
-        fresh; P_z starts at zero so the first forward pass equals the stage-1 model's. Returns the copied keys."""
+        fresh. P_z's bias is copied (stage 1 used z = 0, so P_z(0) = bias) and its weight is set to
+        pz_init_scale x PyTorch's default initialisation:
+            0     the first forward pass equals stage 1 exactly, BUT the MSE gradient into the posterior is then
+                  exactly zero, so the KL alone collapses it onto the prior (seen in run cnn_ws, Nov 3)
+            >0    (e.g. 0.01) nearly equal to stage 1, and the posterior gets an MSE gradient from step 1
+        Returns the copied keys."""
         own = self.state_dict()
         keep = {k: v for k, v in state_dict.items() if not k.startswith(self.FRESH) and k in own}
         missing = [k for k in own if not k.startswith(self.FRESH) and k not in keep]
@@ -284,7 +290,9 @@ class WorldModel(nn.Module):
             raise KeyError(f"warm start checkpoint lacks {missing[:5]} ... (different encoder or sizes?)")
         self.load_state_dict(keep, strict=False)
         with torch.no_grad():
-            self.P_z.weight.zero_(); self.P_z.bias.copy_(state_dict["P_z.bias"])   # P_z(z) = stage-1's P_z(0)
+            fresh = nn.Conv2d(self.cfg.z_ch, self.cfg.hidden, 1).to(self.P_z.weight.device)  # default init
+            self.P_z.weight.copy_(fresh.weight * pz_init_scale)
+            self.P_z.bias.copy_(state_dict["P_z.bias"])                       # P_z(0) = stage-1's P_z(0)
         return sorted(keep)
 
     # ---- epistemic helper (for the policy later) ---------------------------------------------------------------
