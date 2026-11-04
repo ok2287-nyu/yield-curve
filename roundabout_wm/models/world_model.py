@@ -58,6 +58,8 @@ class WMConfig:
     z_ch: int = 8               # latent channels per 6 m cell -> z is z_ch x 8 x 8 = 512 numbers
     dropout: float = 0.1        # Dropout2d in Pred (input u, output h) and Dec; NOT in the encoder or the prior head
     p_zdrop: float = 0.5        # probability of sampling z from the prior on a training step
+    p_openloop: float = 0.0     # probability that a whole training sequence uses prior z at EVERY step (as in
+                                # validation and imagination); the rest use per-step z-dropout as above
     beta: float = 1e-6          # KL weight, relative to a per-pixel MEAN squared error
     prior_sg: bool = True       # stop-gradient on prior samples during z-dropout training
     deterministic: bool = False  # stage 1: z = 0 always, no prior/posterior, no KL
@@ -220,6 +222,8 @@ class WorldModel(nn.Module):
 
         greens, kls, stds, std_maps, zs = [], [], [], [], []
         B = h.shape[0]
+        if z_source == "mix":                       # which sequences are fully open loop (drawn once per sequence)
+            open_loop = torch.rand(B, device=h.device) < cfg.p_openloop
         for k in range(n_pred):
             i = n - 1 + k                                                          # current frame; predict i+1
             if z_source == "zero":                  # deterministic: no heads run, z = 0 (P_z(0) = its bias only)
@@ -237,7 +241,7 @@ class WorldModel(nn.Module):
                 z_q = self._sample(mu_q, lv_q)
             if z_source == "mix":
                 z_p = self._sample(mu_p, lv_p, detach=cfg.prior_sg)
-                use_prior = (torch.rand(B, device=h.device) < cfg.p_zdrop)[:, None, None, None]
+                use_prior = ((torch.rand(B, device=h.device) < cfg.p_zdrop) | open_loop)[:, None, None, None]
                 z = torch.where(use_prior, z_p, z_q)
             elif z_source == "post":
                 z = z_q

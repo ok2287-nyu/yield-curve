@@ -42,6 +42,11 @@ With P_z = 0 the MSE gradient into the posterior is exactly zero, so only the KL
 | ws_b1e-5 | 0 | 0 | 1e-5 |
 | ws_both | 0.01 | 2000 | 1e-4 |
 
+Results at 10k steps (Nov 4): ws_pz collapsed like the control; ws_b1e-5, ws_warm and ws_both use z (KL 6-24 nats)
+but their prior samples are worse than the deterministic mean (prior/empty 1 s ~0.37 vs 0.31) and fade (mass @4 s
+0.61-0.72 vs 1.00), while the posterior is 5-14x better than the prior. Next, from ws_both: `--p_openloop 0.5`
+(exposure bias) and `--beta 1e-3` (posterior shortcut).
+
 ## Order and gate
 
 1. `cnn` first, alone. Gate before anyone trains `vit` / `vit_mae`: beats predict-empty and warp-previous at

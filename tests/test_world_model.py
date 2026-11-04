@@ -244,6 +244,27 @@ def test_beta_schedule():
     assert beta_at(0, A) == 1e-4
 
 
+def test_open_loop_sequences_never_use_the_posterior():
+    """With p_openloop = 1 every training step samples the prior: the prediction cannot depend on future frames
+    (the posterior still sees them for the KL), and with the stop-gradient the MSE never reaches the posterior."""
+    m, b = _model(p_openloop=1.0, p_zdrop=0.0, beta=0.0), _batch()
+    imgs2 = b["images"].clone()
+    imgs2[:, N_COND:] = torch.rand_like(imgs2[:, N_COND:])
+    m.eval()
+    torch.manual_seed(3); g1 = m(b["images"], b["actions"], b["speed"], N_PRED, z_source="mix")["green"]
+    torch.manual_seed(3); g2 = m(imgs2, b["actions"], b["speed"], N_PRED, z_source="mix")["green"]
+    assert torch.equal(g1, g2)
+    m.train()
+    loss, _ = m.loss(b, N_PRED)
+    loss.backward()
+    assert sum(float(p.grad.abs().sum()) for p in m.posterior.parameters() if p.grad is not None) == 0.0
+    m0 = _model(p_openloop=0.0, p_zdrop=0.0)                      # control: all-posterior sequences do depend on it
+    m0.eval()
+    torch.manual_seed(3); h1 = m0(b["images"], b["actions"], b["speed"], N_PRED, z_source="mix")["green"]
+    torch.manual_seed(3); h2 = m0(imgs2, b["actions"], b["speed"], N_PRED, z_source="mix")["green"]
+    assert not torch.equal(h1, h2)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
