@@ -60,6 +60,30 @@ share of the visible box area, and how often such a pop-in comes within 15 m of 
 the same crop with the ego lower (row 55), and a 96 m crop. A bigger crop has longer edges, so more far-away
 pop-ins: compare the area share and the close-pop-in rate, not just the window count.
 
+## Driving inside the model (imagined roundabout)
+
+Interactive, in the portal's Jupyter (once: `pip install ipywidgets`, and use the venv as the kernel):
+
+```python
+import sys; sys.path.insert(0, "/scratch/<netid>/yield/roundabout_wm")
+from roundabout_wm.sim import play
+sim = play("runs/cnn_det/best.pt", "../round_cache", "../round_data", window=0)
+```
+
+Buttons set the ego's acceleration (+1.5 / 0 / −3 m/s², or the human's) and steering (the human's route, or a
+fixed curvature), step 0.2 s or play 1 s, save a moment and go back to it, reset, or pick a new scene. The left
+panel is imagined (real road and ego from the map; other road users from the model), the right panel the real log.
+
+Without a GUI, compare plans from the same moment as one GIF:
+
+```bash
+python scripts/drive_wm.py --ckpt runs/cnn_det/best.pt --cache ../round_cache --data_dir ../round_data \
+    --scene 0 --plans log brake go --seconds 4
+```
+
+"Follow the human's route" follows it by distance travelled, so brake and go stay on the same path; past the end of
+the log the ego keeps its last curvature. Past 4 s the model is beyond its training horizon (the panel says so).
+
 ## Looking at the predictions
 
 ```bash
