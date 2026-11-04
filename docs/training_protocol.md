@@ -74,6 +74,10 @@ rate at 2 s and 4 s):
 python scripts/eval_baselines.py --cache ../round_cache --data_dir ../round_data --ckpt runs/cnn_det/best.pt
 ```
 
+The table now has a `ctrv_blur` row: constant turn rate, blurred and scaled per horizon step, both tuned on 1,000
+**train** windows to minimise MSE (the tuned sigma/alpha are printed and saved in the csv). MSE rewards hedging, so
+this is the fair kinematic baseline for a model that predicts a blurry mean. Report the model against it.
+
 ---
 
 ## 2. Stage 2: the stochastic model (50,000 steps, warm-started from stage 1)
@@ -99,9 +103,13 @@ sbatch --export=ALL,ENCODER=vit,RUN=vit_mae_sto,STEPS=50000,WANDB=1,EXTRA_ARGS="
 Train long: 50k steps, the same as stage 1 (about 2.8 h for the CNN). PPUU trained its stochastic model for at least
 as long as its deterministic one; 10k-step stage-2 runs were not long enough to judge.
 
-**Use `last.pt`, not `best.pt`, for a stochastic run.** `best.pt` is the checkpoint with the lowest prior MSE, and a
-single sample is *supposed* to have a higher MSE than the mean, so `best.pt` tends to be an early, nearly
-deterministic checkpoint (this happened: `ws_both/best.pt` was step 1,000 of 10,000).
+**Which checkpoint.** Since the `eval-tools` merge, a stochastic run saves as `best.pt` the checkpoint with the
+lowest **validation ELBO** (posterior MSE + warm-up MSE + beta x KL, with the run's final beta; logged as `elbo`), not
+the lowest prior MSE. Prior MSE is the wrong criterion for a stochastic model: a single sample is *supposed* to have a
+higher MSE than the mean, so it picked an early, nearly deterministic checkpoint (`ws_both/best.pt` was step 1,000
+of 10,000). Deterministic runs still use prior MSE (`--best_metric auto`; force either with `--best_metric prior|elbo`).
+**Runs trained before this change** (`ws_*`, `ws_both_long`): their `best.pt` is still the old choice, so use
+`last.pt` for them.
 
 **Numbers to check** (terminal):
 
@@ -121,6 +129,7 @@ EOF
 | `post@k` < `prior@k` | yes (the posterior saw the future) | equal: z is unused |
 | `mass@20` | rising towards 1 over training | stuck well below 1: samples fade |
 | `act_sens` | clearly above 0 | ~0: the model ignores the ego |
+| `elbo` | falling, then flat | rising while `kl` rises: beta too small, z is memorising |
 
 A single prior sample is **expected** to have a higher MSE than the stage-1 model. That is not a failure: each sample
 commits to one future, the mean hedges. Do not judge stage 2 by beating stage 1 on MSE.
@@ -133,10 +142,11 @@ The numbers above cannot tell "diverse, plausible futures" from "noise". Look at
 
 ```bash
 python scripts/compare_models.py --cache ../round_cache --det runs/cnn_det/best.pt \
-    --stoch runs/cnn_sto/last.pt --scenes 0 72 145 218 290 363 --k 4 --out_dir runs/compare_cnn_sto
+    --stoch runs/cnn_sto/best.pt --scenes 0 72 145 218 290 363 --k 4 --out_dir runs/compare_cnn_sto
 ```
 
-(Several stochastic runs can be compared at once: list more `last.pt` files after `--stoch`.) It writes one sheet per
+(Several stochastic runs can be compared at once: list more checkpoints after `--stoch`; `last.pt` for runs from
+before the ELBO change.) It writes one sheet per
 scene, `runs/compare_cnn_sto/compare_<scene>.png`, downloadable from the portal's Files view, with one column per
 0.4 s and these rows:
 
@@ -166,6 +176,22 @@ Go through every sheet and answer each question **by looking**:
 5. **Is one of the samples close to what really happened?** For the scenes where the truth does something specific
    (merges, waits), at least one prior sample should show roughly that. The printed `best` (best of 4) should be
    clearly lower than `mean` (average of the 4) in scenes where samples differ.
+
+### Does the model predict that others react to the ego? (reaction map)
+
+```bash
+python scripts/reaction_map.py --ckpt runs/cnn_sto/best.pt --cache ../round_cache --data_dir ../round_data \
+    --scene 145 --a brake --b go --seconds 4 --k 8
+```
+
+Same start, two plans (`brake` -3 m/s², `go` +1.5 m/s², `coast`, `log` = the human, or a number). Plan B's prediction
+is warped into plan A's ego frame at every step (the camera moved differently), so what remains in the `B - A` row is
+the predicted change in the *other* road users: green = more traffic under B, red = less. For a stochastic model both
+plans are the mean of `--k` prior samples with the same seeds. It prints the reaction score (mean |B - A| over the
+area both crops share) every 0.4 s. Pick scenes with a car near an entry: a reactive model should show that car
+yielding (red ahead of it) or going (green) depending on the ego's plan. Caveat: the model learned from logs where the
+human ego reacted to others, so a difference can be correlation; look at whether it appears only after the plans
+diverge, and only on cars that interact with the ego.
 
 Known limitation, not a model failure: road users that enter the 48 m crop after the 2 s warm-up (the model never saw
 them) are missing from every row except the posterior and the truth. At 4 s this is ~43% of the true car area (see
