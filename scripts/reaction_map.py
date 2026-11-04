@@ -83,7 +83,7 @@ def compare(sim, scene, plan_a, plan_b, steps, k, seed, margin):
     core = -torch.nn.functional.max_pool2d(-core[:, None], 2 * m + 1, 1, m)[:, 0] > 0.5
     diff = (warped - gA) * core
     egoB_in_A = warp_previous(ego.expand(steps, 1, 64, 64).clone(), pB, pA[:, None], rc)[:, 0, 0] > 0.5
-    return dict(gA=gA, gB=gB, rA=rA, rB=rB, vA=vA, vB=vB, warped=warped, core=core, diff=diff, ego=ego,
+    return dict(gA=gA, gB=gB, rA=rA, rB=rB, vA=vA, vB=vB, pA=pA, pB=pB, warped=warped, core=core, diff=diff, ego=ego,
                 egoB_in_A=egoB_in_A, car=float(ego.sum()))
 
 

@@ -206,6 +206,20 @@ created + or deleted - by the plan, in cars) and `|net|/reaction` (0 = cars only
 leakage: the plan used as evidence about the traffic. It ends with the five scenes with the most leakage at 2 s:
 look at those with the single-scene command.
 
+**Leakage, measured where no reaction is possible.** A negative `net` above can also be a real reaction (a car up
+the ring yields and enters the view later). `scripts/leakage.py` only scores road users the ego cannot affect within
+4 s: seen during the warm-up, moving away from the ego under both plans, and whose path never comes within 8 m of the
+ego's (~10 min on CPU for 300 scenes):
+
+```bash
+python scripts/leakage.py --ckpt runs/cnn_det/best.pt --cache ../round_cache --data_dir ../round_data --n_scenes 300
+```
+
+`receding` (|B - A| around those road users, per unit of their true area) should sit at `floor` (the same measure for a
+model with no leakage). `interacting` is the same measure around the other seen road users, for scale. Check
+`coverage` (~1 means the model's cars are where the region expects them) and `receding area` (steps with too little
+receding traffic print `-`).
+
 Known limitation, not a model failure: road users that enter the 48 m crop after the 2 s warm-up (the model never saw
 them) are missing from every row except the posterior and the truth. At 4 s this is ~43% of the true car area (see
 `scripts/fov_popin.py`). Scene 363 is an example.
