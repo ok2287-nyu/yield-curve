@@ -45,6 +45,8 @@ python scripts/build_cache.py   --data_dir $DATA --out_dir $SCRATCH/round_cache
 `$DATA` is the folder holding `NN_tracks.csv`, `NN_tracksMeta.csv`, `NN_recordingMeta.csv`, `NN_background.png`.
 Each person uses their own copy (rounD licence: no sharing inside the group).
 
+**Training an encoder run? Follow [`docs/training_protocol.md`](docs/training_protocol.md)** (stage 1 deterministic, stage 2 stochastic, then the manual check).
+
 ## Teammate setup (NYU HPC Cloud Bursting)
 
 Rules first:
