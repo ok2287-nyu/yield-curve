@@ -234,12 +234,17 @@ team, **inside the team only**: the images are rendered from rounD data.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Job stays in `CF` for more than ~10 min, then `CANCELLED by 0`, no `.out` file | the cloud node failed to start (happened Nov 3) | resubmit; if it repeats, use an L4: add `--partition=g2-standard-12 --cpus-per-task=8 --mem=32G` to `sbatch` and `--workers 6` to `EXTRA_ARGS` |
+| Job stays in `CF` for ~13-15 min, then `CANCELLED`, no `.out` file | GCP has no A100 free for the cloud node (HPC support, Nov 5: A100s are scarce at the moment) | resubmit and be patient. **Do not use the L4 partition `g2-standard-12`**: HPC support says L4s are very hard to get there |
 | `ModuleNotFoundError: numpy` | the venv is not active (new portal session) | `source /scratch/$USER/yield/venv/bin/activate` |
 | `ls: cannot access 'wm_*.out'` | you are in `~` | `cd /scratch/$USER/yield/roundabout_wm` |
 | W&B runs stopped appearing | `wandb offline` was run in the repo folder (e.g. by pasting log text into the shell) | `wandb online` in the repo folder |
 | Stage 2 `kl` ~0.01 from the start | posterior collapse | check `--pz_init_scale 0.01 --kl_warmup_steps 2000` are in `EXTRA_ARGS` |
 | A rerun starts at a high step number | the run name already exists, so it resumed | use a new `RUN=` name |
+
+**Cloud Bursting rules (HPC support, Nov 5).** A GCP node **shuts down automatically if its resources are
+underused for 20 minutes**, so never hold a GPU job open for interactive or CPU-only work (evaluation scripts,
+`reaction_map.py`, `leakage.py`, `compare_models.py` run fine on the CPU Jupyter session). An A100 costs about $2 per
+GPU-hour. Because A100s are scarce, submit training runs as soon as they are ready rather than in a batch later.
 
 **GPU budget** (300 GPU-hours each; one encoder's two stages cost about 5-6 A100-hours). Your usage so far:
 
