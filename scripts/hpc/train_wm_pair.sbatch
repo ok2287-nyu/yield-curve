@@ -1,7 +1,7 @@
 #!/bin/bash
 # Two world-model runs side by side on ONE A100 (Cloud Bursting). A single run keeps the A100 only ~57% busy
 # (ws_both_long, Nov 4), and A100 nodes are scarce, so each node we get trains two experiments. Each run resumes
-# from runs/<RUN>/last.pt as usual (--requeue safe). The 12 CPUs are split: 5 data workers per run.
+# from runs/<RUN>/last.pt as usual (--requeue safe). The CPUs are split between the two runs' data workers.
 #
 #   sbatch --export=ALL,ENCODER=cnn,STEPS=20000,WANDB=1,\
 #   RUN1=ws_ol20,ARGS1="--init_from runs/cnn_det/best.pt --pz_init_scale 0.01 --kl_warmup_steps 2000 --beta 1e-4 --p_openloop 0.2",\
@@ -33,13 +33,17 @@ if [ -n "${WANDB:-}" ]; then
   if [ "$WANDB" = "offline" ]; then export WANDB_MODE=offline; fi
 fi
 
-launch() {   # $1 run name, $2 extra args
+# One GPU: both runs share it. Two GPUs (e.g. --partition=c24m170-a100-2 --gres=gpu:2 --cpus-per-task=24): one each.
+NGPU=$(nvidia-smi -L | wc -l)
+WORKERS=$(( ${SLURM_CPUS_PER_TASK:-12} / 2 - 1 ))
+echo "GPUs: $NGPU | data workers per run: $WORKERS"
+launch() {   # $1 run name, $2 extra args, $3 GPU index
   mkdir -p "runs/$1"
-  python -u scripts/train_wm.py --cache "$ROOT/round_cache" --encoder "${ENCODER:-cnn}" --run "$1" \
-    --workers 5 $COMMON $2 >> "runs/$1/train.out" 2>&1 &
+  CUDA_VISIBLE_DEVICES=$3 python -u scripts/train_wm.py --cache "$ROOT/round_cache" --encoder "${ENCODER:-cnn}" \
+    --run "$1" --workers $WORKERS $COMMON $2 >> "runs/$1/train.out" 2>&1 &
 }
-launch "$RUN1" "${ARGS1:-}"; P1=$!
-launch "$RUN2" "${ARGS2:-}"; P2=$!
+launch "$RUN1" "${ARGS1:-}" 0; P1=$!
+launch "$RUN2" "${ARGS2:-}" $(( NGPU > 1 ? 1 : 0 )); P2=$!
 sleep 300; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv   # both running?
 wait $P1; E1=$?
 wait $P2; E2=$?
