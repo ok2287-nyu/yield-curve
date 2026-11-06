@@ -367,7 +367,11 @@ def main():
     if new_log:
         log.writeheader()
 
-    use_amp = dev == "cuda"
+    # bf16 autocast only where the GPU has native bf16 (A100/H100/L4: compute capability >= 8). A V100 (7.0) would
+    # emulate it slowly or fail, so it trains in fp32.
+    use_amp = dev == "cuda" and torch.cuda.get_device_capability()[0] >= 8
+    if dev == "cuda":
+        print(f"GPU {torch.cuda.get_device_name()} | {'bf16 autocast' if use_amp else 'fp32 (no native bf16)'}")
     keys = ("loss", "mse", "mse_warm", "kl", "prior_std")
     last_ckpt, t0 = time.time(), time.time()
     run = {k: 0.0 for k in keys}; run_n = 0
