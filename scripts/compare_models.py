@@ -29,6 +29,7 @@ from inspect_wm import compose, labelled_grid, to_img
 from roundabout_wm.config import Config
 from roundabout_wm.dataset import RounDWindows
 from roundabout_wm.models.world_model import GREEN, WMConfig, WorldModel
+from roundabout_wm.wm_eval import sharpness_sums
 
 
 def load(path, dev):
@@ -90,8 +91,11 @@ def main():
             mean_mse = ((samples.mean(0) - tg) ** 2).mean((1, 2, 3))
             m = samples.sum((2, 3, 4)).mean(0) / tg.sum((1, 2, 3)).clamp_min(1e-6)
             spread = samples.std(0).mean((1, 2, 3)) if samples.shape[0] > 1 else torch.zeros(T)
-            return {k: (m[k - 1].item(), spread[k - 1].item(), mean_mse[k - 1].item(), mse[:, k - 1].min().item())
-                    for k in (5, 20)}
+            sq, sm = sharpness_sums(samples)                               # pooled over the k samples
+            tq, tm = sharpness_sums(tg[None])
+            sharp = (sq / sm.clamp_min(1e-8)) / (tq / tm.clamp_min(1e-8)).clamp_min(1e-8)
+            return {k: (m[k - 1].item(), spread[k - 1].item(), mean_mse[k - 1].item(), mse[:, k - 1].min().item(),
+                        sharp[k - 1].item()) for k in (5, 20)}
         report[(idx, "deterministic")] = numbers(g_det[None])
 
         for name, m, _, _ in stochs:
@@ -112,14 +116,15 @@ def main():
             report[(idx, name)]["post"] = {k: post_mse[k - 1].item() for k in (5, 20)}
         labelled_grid(rows, labels, col_times).save(os.path.join(a.out_dir, f"compare_{idx}.png"))
 
-    print(f"\nper scene: mass ratio / spread / MSE of mean-of-{a.k} / MSE of best-of-{a.k} / MSE of the posterior"
-          f"   at 1 s | 4 s")
+    print(f"\nper scene: mass ratio / sharpness (vs truth) / spread / MSE of mean-of-{a.k} / MSE of best-of-{a.k} / "
+          f"MSE of the posterior   at 1 s | 4 s")
     for idx in a.scenes:
         print(f"scene {idx}")
         for nm in ["deterministic"] + [s[0] for s in stochs]:
             r = report[(idx, nm)]
             post = lambda k: f" post {r['post'][k]:.4f}" if "post" in r else ""
-            cell = lambda k: f"m{r[k][0]:4.2f} s{r[k][1]:.4f} mean {r[k][2]:.4f} best {r[k][3]:.4f}{post(k)}"
+            cell = lambda k: (f"m{r[k][0]:4.2f} sh{r[k][4]:4.2f} s{r[k][1]:.4f} mean {r[k][2]:.4f} "
+                              f"best {r[k][3]:.4f}{post(k)}")
             print(f"  {nm:14s} 1 s: {cell(5)} | 4 s: {cell(20)}")
     print(f"wrote {len(a.scenes)} sheets to {a.out_dir}/")
 

@@ -70,3 +70,12 @@ def counterfactual_accel(actions, ego_state, n_cond, stats, dt, accel):
     act = actions.clone()
     act[:, n_cond - 1:, 0] = (accel - a_mean[0]) / a_std[0]
     return act, _reintegrate_speeds(act, ego_state, n_cond, stats, dt).to(actions.dtype)
+
+
+def sharpness_sums(green):
+    """green (B, T, 1, H, W) in [0, 1] -> (sum g^2, sum g) per step, each (T,), summed over the batch.
+    Sharpness = sum g^2 / sum g: the mass-weighted mean intensity. 1 for solid cars, ~0.25 for a car smeared over 4x
+    its area, 0.5 for half a car in each of two places, the intensity itself for a faded car. Independent of how
+    much green there is (that is `mass`). Report it relative to the truth's own value (rendered cars have soft edges)."""
+    g = green.float()
+    return (g * g).sum((0, 2, 3, 4)), g.sum((0, 2, 3, 4))

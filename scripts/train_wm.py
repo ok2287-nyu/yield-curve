@@ -20,6 +20,8 @@ Validation (val recordings, dropout OFF), all per rollout step, summarised at 1 
     kl_t         KL(q || p) per step
     prior_std_t  mean prior sigma per step (flat or shrinking towards 0 = deterministic prior)
     mass_t       predicted / true green mass per step (falling = cars fading)
+    sharp_t      sharpness of one prior sample / sharpness of the truth, sharpness = sum g^2 / sum g (falling = cars
+                 smeared or dimmed, even when mass is kept)
     spread_t     mean |difference| between two prior samples of the same window (~0 = z is ignored under the
                  prior, so samples cannot differ: the model is effectively deterministic)
     act_sens     mean |change| of the prediction when the future actions are swapped between samples
@@ -182,7 +184,7 @@ def validate(model, val_loader, a, dev, cfg, stats):
     val_loader.generator.manual_seed(VAL_SEED)       # the SAME val windows every validation (comparable over time)
     n, rc, dt = cfg.data.n_cond, cfg.render, cfg.data.dt
     acc = {k: 0 for k in ("prior", "post", "empty", "copy", "warp", "kl", "std", "mass_pred", "mass_true",
-                          "spread")}
+                          "spread", "sq_pred", "sq_true")}
     sens, warm, nb = 0.0, 0.0, 0
     for i, b in enumerate(val_loader):
         if i >= a.val_batches:
@@ -214,11 +216,16 @@ def validate(model, val_loader, a, dev, cfg, stats):
         acc["spread"] = acc["spread"] + (out["green"] - out2["green"]).abs().float().mean((0, 2, 3, 4))
         acc["mass_pred"] = acc["mass_pred"] + out["green"].float().sum((2, 3, 4)).mean(0)
         acc["mass_true"] = acc["mass_true"] + tgt.sum((2, 3, 4)).mean(0)
+        acc["sq_pred"] = acc["sq_pred"] + (out["green"].float() ** 2).sum((2, 3, 4)).mean(0)
+        acc["sq_true"] = acc["sq_true"] + (tgt.float() ** 2).sum((2, 3, 4)).mean(0)
         sens += (out["green"] - out_sw["green"]).abs().float().mean().item()
         warm += ((out["green_warm"].float() - imgs[:, :n, GREEN:GREEN + 1]) ** 2).mean().item()
         nb += 1
     model.train()
     v = {k: (x / nb).cpu() for k, x in acc.items()}
+    sharp_pred = v.pop("sq_pred") / v["mass_pred"].clamp_min(1e-8)
+    sharp_true = v.pop("sq_true") / v["mass_true"].clamp_min(1e-8)
+    v["sharp"] = sharp_pred / sharp_true.clamp_min(1e-8)
     v["mass"] = v.pop("mass_pred") / v.pop("mass_true").clamp_min(1e-8)
     v["gap"] = v["prior"] - v["post"]
     v["act_sens"], v["mse_warm"] = sens / nb, warm / nb
@@ -263,7 +270,7 @@ def gpu_util():
 LOG_FIELDS = (["step", "split", "loss", "mse", "mse_warm", "kl", "prior_std", "act_sens", "gap_mean", "s_per_step",
                "gpu_util", "time", "elbo"]
               + [f"{m}@{k}" for k in REPORT_STEPS for m in ("prior", "post", "empty", "copy", "warp", "mass", "kl",
-                                                             "std", "spread")])
+                                                             "std", "spread", "sharp")])
 
 
 class WandB:
@@ -435,11 +442,11 @@ def main():
                        "act_sens": v["act_sens"], "gap_mean": v["gap"].mean().item(), "time": time.time(),
                        "elbo": (v["post"].mean() + v["mse_warm"] + a.beta * v["kl"].mean()).item()}
                 print(f"  VAL (step {step})        " + "  ".join(f"{k * 0.2:.0f}s" .rjust(9) for k in REPORT_STEPS))
-                for name in ("prior", "post", "empty", "copy", "warp", "mass", "spread", "kl", "std"):
+                for name in ("prior", "post", "empty", "copy", "warp", "mass", "sharp", "spread", "kl", "std"):
                     vals = [v[name][min(k, len(v[name])) - 1].item() for k in REPORT_STEPS]
                     for k, x in zip(REPORT_STEPS, vals):
                         row[f"{name}@{k}"] = x
-                    fmt = "{:9.1f}" if name == "kl" else "{:9.3f}" if name in ("mass", "std") else "{:9.5f}"
+                    fmt = "{:9.1f}" if name == "kl" else "{:9.3f}" if name in ("mass", "std", "sharp") else "{:9.5f}"
                     print(f"    {name:6s}               " + "  ".join(fmt.format(x) for x in vals))
                 print(f"    act_sens {v['act_sens']:.5f} | warm-up mse {v['mse_warm']:.5f} | "
                       f"gap(prior-post) mean {v['gap'].mean().item():.5f}")
