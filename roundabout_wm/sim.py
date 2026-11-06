@@ -135,8 +135,9 @@ class ImaginedDrive:
         else:
             mu, lv = m.prior(self.h)
             z = mu + (0.5 * lv).exp() * torch.randn(mu.shape, generator=self.gen, device=self.dev)
-        self.h = m.pred(self.h, m.P_z(z) + m.action_map(a_n, v_n))
-        green = m.decode(self.h)[0, 0].float().cpu()
+        now = self.history[-1][None].to(self.dev)                                   # current frame (real or imagined)
+        self.h, g = m.rollout_step(self.h, z, a_n, v_n, frame=now, prev=now[:, 1:2])
+        green = g[0, 0].float().cpu()
 
         v0 = self.state[3]
         self.state = step_np(self.state, np.array([acc, cur]), d.dt)              # kinematic ego
