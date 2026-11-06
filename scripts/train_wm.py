@@ -267,7 +267,8 @@ def gpu_util():
         return ""
 
 
-LOG_FIELDS = (["step", "split", "loss", "mse", "mse_warm", "kl", "prior_std", "act_sens", "gap_mean", "s_per_step",
+LOG_FIELDS = (["step", "split", "loss", "mse", "mse_warm", "kl", "prior_std", "post_logvar", "prior_logvar",
+               "mean_gap", "act_sens", "gap_mean", "s_per_step",
                "gpu_util", "time", "elbo"]
               + [f"{m}@{k}" for k in REPORT_STEPS for m in ("prior", "post", "empty", "copy", "warp", "mass", "kl",
                                                              "std", "spread", "sharp")])
@@ -401,7 +402,7 @@ def main():
     use_amp = dev == "cuda" and torch.cuda.get_device_capability()[0] >= 8
     if dev == "cuda":
         print(f"GPU {torch.cuda.get_device_name()} | {'bf16 autocast' if use_amp else 'fp32 (no native bf16)'}")
-    keys = ("loss", "mse", "mse_warm", "kl", "prior_std")
+    keys = ("loss", "mse", "mse_warm", "kl", "prior_std", "post_logvar", "prior_logvar", "mean_gap")
     last_ckpt, t0 = time.time(), time.time()
     run = {k: 0.0 for k in keys}; run_n = 0
     model.train()

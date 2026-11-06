@@ -246,6 +246,7 @@ class WorldModel(nn.Module):
         prev = real_g[:, n - 1]                     # current green frame: the last real one, then the model's own
 
         greens, kls, stds, std_maps, zs = [], [], [], [], []
+        lat = []                                    # (posterior logvar, prior logvar, |mu_q - mu_p| / sigma_p) means
         B = h.shape[0]
         if z_source == "mix":                       # which sequences are fully open loop (drawn once per sequence)
             open_loop = torch.rand(B, device=h.device) < cfg.p_openloop
@@ -266,6 +267,9 @@ class WorldModel(nn.Module):
             if use_post:
                 mu_q, lv_q = self.posterior(torch.cat([h, e[:, i + 1]], 1))
                 kls.append(gauss_kl(mu_q, lv_q, mu_p, lv_p))
+                with torch.no_grad():
+                    lat.append(torch.stack([lv_q.float().mean(), lv_p.float().mean(),
+                                            ((mu_q - mu_p).abs() / (0.5 * lv_p).exp()).float().mean()]))
                 z_q = self._sample(mu_q, lv_q)
             if z_source == "mix":
                 z_p = self._sample(mu_p, lv_p, detach=cfg.prior_sg)
@@ -287,6 +291,7 @@ class WorldModel(nn.Module):
         return {"green": torch.stack(greens, 1), "green_warm": green_warm,
                 "kl": torch.stack(kls, 1) if kls else None,
                 "prior_std": torch.stack(stds, 1).detach(), "prior_std_map": torch.stack(std_maps, 1).detach(),
+                "latent_stats": torch.stack(lat).mean(0) if lat else None,
                 "z": torch.stack(zs, 0)}
 
     def loss(self, batch, n_pred, beta: float | None = None):
@@ -300,8 +305,11 @@ class WorldModel(nn.Module):
         mse_warm = ((out["green_warm"].float() - imgs[:, :n, GREEN:GREEN + 1]) ** 2).mean()
         kl = out["kl"].mean() if out["kl"] is not None else torch.zeros((), device=mse_t.device)
         loss = mse_t.mean() + mse_warm + (self.cfg.beta if beta is None else beta) * kl
+        ls = out["latent_stats"]
+        lat = {"post_logvar": ls[0].item(), "prior_logvar": ls[1].item(), "mean_gap": ls[2].item()} if ls is not None \
+            else {"post_logvar": 0.0, "prior_logvar": 0.0, "mean_gap": 0.0}
         return loss, {"loss": loss.item(), "mse": mse_t.mean().item(), "mse_warm": mse_warm.item(),
-                      "kl": kl.item(), "prior_std": out["prior_std"].mean().item()}
+                      "kl": kl.item(), "prior_std": out["prior_std"].mean().item()} | lat
 
     # ---- stage 2 initialisation ----------------------------------------------------------------------------------
     FRESH = ("prior.", "posterior.", "P_z.")
