@@ -63,6 +63,11 @@ class WMConfig:
     beta: float = 1e-6          # KL weight, relative to a per-pixel MEAN squared error
     prior_sg: bool = True       # stop-gradient on prior samples during z-dropout training
     deterministic: bool = False  # stage 1: z = 0 always, no prior/posterior, no KL
+    residual: bool = False      # PPUU-style: each decoded green frame = sigmoid(Dec(h) + previous green frame), so a
+                                # car carries over unless the decoder removes it (pytorch-PPUU FwdCNN_VAE.forward)
+    reencode: bool = False      # PPUU-style: each rollout step also reads the CURRENT frame through the encoder
+                                # (real road and ego channels, the model's own predicted green), so the model re-reads
+                                # the cars it drew; needs the window's road/ego frames up to n_cond + n_pred - 1
     logvar_min: float = -8.0
     logvar_max: float = 6.0
 
@@ -168,8 +173,24 @@ class WorldModel(nn.Module):
         """act (B, 2) normalised (acc, curv); spd (B, 1) normalised speed -> (B, C, 8, 8)."""
         return self.A(torch.cat([act, spd], -1)).view(act.shape[0], self.cfg.hidden, 8, 8)
 
-    def decode(self, h):
-        return torch.sigmoid(self.dec(h))                                          # (B, 1, 64, 64)
+    def decode(self, h, prev=None):
+        """(B, 1, 64, 64). prev: the previous green frame (B, 1, 64, 64), added to the logits if cfg.residual."""
+        logits = self.dec(h)
+        if self.cfg.residual and prev is not None:
+            logits = logits + prev.to(logits.dtype)
+        return torch.sigmoid(logits)
+
+    def rollout_step(self, h, z, act, spd, frame=None, prev=None):
+        """One imagined step from h (frame i) to h (frame i+1). z (B, z_ch, 8, 8); act (B, 2); spd (B, 1);
+        frame: the current frame i (B, 3, 64, 64), read through the encoder if cfg.reencode; prev: the current
+        green frame (B, 1, 64, 64) for the residual decoder. Returns (h, green). Used by forward() and the simulator."""
+        u = self.P_z(z.to(h.dtype)) + self.action_map(act, spd)
+        if self.cfg.reencode:
+            if frame is None:
+                raise ValueError("reencode model: rollout_step needs the current frame")
+            u = u + self.P_e(self.encoder(frame))
+        h = self.pred(h, u)
+        return h, self.decode(h, prev)
 
     def _sample(self, mu, lv, detach=False):
         if detach:
@@ -218,7 +239,11 @@ class WorldModel(nn.Module):
         e = self.encode(images[:, :T_enc])
         h, hs = self.warmup(e[:, :n], actions, speeds)
         # decoded step by step (not as one B*n batch) so a held dropout mask is per sample: see StickyDropout2d
-        green_warm = torch.stack([self.decode(hi) for hi in hs], 1)
+        real_g = images[:, :n, GREEN:GREEN + 1]
+        green_warm = torch.stack([self.decode(hi, real_g[:, j - 1] if j > 0 else None) for j, hi in enumerate(hs)], 1)
+        if cfg.reencode and images.shape[1] < n + n_pred - 1:
+            raise ValueError(f"reencode model: images must include road/ego frames up to {n + n_pred - 1}")
+        prev = real_g[:, n - 1]                     # current green frame: the last real one, then the model's own
 
         greens, kls, stds, std_maps, zs = [], [], [], [], []
         B = h.shape[0]
@@ -226,11 +251,14 @@ class WorldModel(nn.Module):
             open_loop = torch.rand(B, device=h.device) < cfg.p_openloop
         for k in range(n_pred):
             i = n - 1 + k                                                          # current frame; predict i+1
+            frame = None
+            if cfg.reencode:                        # current frame i: real road/ego, the model's own green (k > 0)
+                frame = images[:, i] if k == 0 else torch.cat(
+                    [images[:, i, :GREEN], prev.to(images.dtype), images[:, i, GREEN + 1:]], 1)
             if z_source == "zero":                  # deterministic: no heads run, z = 0 (P_z(0) = its bias only)
                 z = torch.zeros(B, cfg.z_ch, 8, 8, device=h.device)
-                u = self.P_z(z.to(h.dtype)) + self.action_map(actions[:, i], speeds[:, i])
-                h = self.pred(h, u)
-                greens.append(self.decode(h))
+                h, g = self.rollout_step(h, z, actions[:, i], speeds[:, i], frame, prev)
+                greens.append(g); prev = g
                 stds.append(torch.zeros(B, device=h.device)); std_maps.append(torch.zeros(B, 8, 8, device=h.device))
                 zs.append(z)
                 continue
@@ -251,9 +279,8 @@ class WorldModel(nn.Module):
                 z = z_seq[k]
             else:
                 raise ValueError(z_source)
-            u = self.P_z(z.to(h.dtype)) + self.action_map(actions[:, i], speeds[:, i])
-            h = self.pred(h, u)
-            greens.append(self.decode(h))
+            h, g = self.rollout_step(h, z, actions[:, i], speeds[:, i], frame, prev)
+            greens.append(g); prev = g
             sd = (0.5 * lv_p).exp()
             stds.append(sd.flatten(1).mean(1)); std_maps.append(sd.mean(1))
             zs.append(z.detach())

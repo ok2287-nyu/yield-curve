@@ -298,6 +298,43 @@ def test_per_sequence_masks_in_training():
     assert all(n > 1 for n in _masks_drawn_per_module(per_sequence=False))
 
 
+def test_anchor_flags_off_change_nothing_and_on_work():
+    """residual / reencode default off: same output as before. On: forward and loss run, gradients reach the
+    encoder through the re-read frames, and the residual decoder carries a frame over when Dec outputs 0."""
+    b = _batch()
+    base = _model().eval()
+    with torch.no_grad():
+        g0 = base(b["images"], b["actions"], b["speed"], N_PRED, z_source="prior")["green"]
+    for kw in ({"residual": True}, {"reencode": True}, {"residual": True, "reencode": True}):
+        m = _model(**kw)
+        m.load_state_dict(base.state_dict())
+        m.train()
+        loss, _ = m.loss(b, N_PRED)
+        loss.backward()
+        assert all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
+        if kw.get("reencode"):                                       # encoder gets gradient from rollout steps too
+            assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.encoder.parameters())
+    with torch.no_grad():                                            # flags off: identical to the base model
+        assert torch.equal(_model().eval()(b["images"], b["actions"], b["speed"], N_PRED, z_source="prior")["green"], g0)
+    m = _model(residual=True)
+    with torch.no_grad():
+        for prm in m.dec[-1].parameters():
+            prm.zero_()                                              # Dec logits = 0 -> output = sigmoid(prev)
+        prev = (torch.rand(1, 1, 64, 64) > 0.5).float()
+        out = m.decode(torch.zeros(1, 256, 8, 8), prev)
+    assert torch.allclose(out, torch.sigmoid(prev))
+
+
+def test_reencode_needs_future_road_frames():
+    b = _batch()
+    m = _model(reencode=True).eval()
+    try:
+        m(b["images"][:, :N_COND], b["actions"], b["speed"], N_PRED, z_source="prior")
+    except ValueError:
+        return
+    raise AssertionError("reencode with only warm-up frames should raise")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
