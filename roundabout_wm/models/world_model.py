@@ -65,6 +65,8 @@ class WMConfig:
     deterministic: bool = False  # stage 1: z = 0 always, no prior/posterior, no KL
     residual: bool = False      # PPUU-style: each decoded green frame = sigmoid(Dec(h) + previous green frame), so a
                                 # car carries over unless the decoder removes it (pytorch-PPUU FwdCNN_VAE.forward)
+    anchor_prior: float = 0.0   # weight of KL(prior || N(0, I)) in the loss: pins the latent's units (our prior is
+                                # learned, so z's scale is otherwise free; PPUU's fixed N(0, I) prior pins it)
     reencode: bool = False      # PPUU-style: each rollout step also reads the CURRENT frame through the encoder
                                 # (real road and ego channels, the model's own predicted green), so the model re-reads
                                 # the cars it drew; needs the window's road/ego frames up to n_cond + n_pred - 1
@@ -246,6 +248,8 @@ class WorldModel(nn.Module):
         prev = real_g[:, n - 1]                     # current green frame: the last real one, then the model's own
 
         greens, kls, stds, std_maps, zs = [], [], [], [], []
+        anchors = []                                # KL(prior || N(0, I)) per step, if cfg.anchor_prior
+        lat = []                                    # (posterior logvar, prior logvar, |mu_q - mu_p| / sigma_p) means
         B = h.shape[0]
         if z_source == "mix":                       # which sequences are fully open loop (drawn once per sequence)
             open_loop = torch.rand(B, device=h.device) < cfg.p_openloop
@@ -266,6 +270,14 @@ class WorldModel(nn.Module):
             if use_post:
                 mu_q, lv_q = self.posterior(torch.cat([h, e[:, i + 1]], 1))
                 kls.append(gauss_kl(mu_q, lv_q, mu_p, lv_p))
+                if cfg.anchor_prior > 0:
+                    anchors.append(gauss_kl(mu_p, lv_p, torch.zeros_like(mu_p), torch.zeros_like(lv_p)))
+                with torch.no_grad():
+                    lat.append(torch.stack([
+                        lv_q.float().mean(), lv_p.float().mean(),
+                        ((mu_q - mu_p).abs() / (0.5 * lv_p).exp()).float().mean(),
+                        mu_q.float().abs().mean(), mu_p.float().abs().mean(),
+                        mu_q.float().std(0).mean() if B > 1 else mu_q.new_zeros((), dtype=torch.float32)]))
                 z_q = self._sample(mu_q, lv_q)
             if z_source == "mix":
                 z_p = self._sample(mu_p, lv_p, detach=cfg.prior_sg)
@@ -286,7 +298,9 @@ class WorldModel(nn.Module):
             zs.append(z.detach())
         return {"green": torch.stack(greens, 1), "green_warm": green_warm,
                 "kl": torch.stack(kls, 1) if kls else None,
+                "kl_anchor": torch.stack(anchors, 1) if anchors else None,
                 "prior_std": torch.stack(stds, 1).detach(), "prior_std_map": torch.stack(std_maps, 1).detach(),
+                "latent_stats": torch.stack(lat).mean(0) if lat else None,
                 "z": torch.stack(zs, 0)}
 
     def loss(self, batch, n_pred, beta: float | None = None):
@@ -300,8 +314,13 @@ class WorldModel(nn.Module):
         mse_warm = ((out["green_warm"].float() - imgs[:, :n, GREEN:GREEN + 1]) ** 2).mean()
         kl = out["kl"].mean() if out["kl"] is not None else torch.zeros((), device=mse_t.device)
         loss = mse_t.mean() + mse_warm + (self.cfg.beta if beta is None else beta) * kl
+        anchor = out["kl_anchor"].mean() if out.get("kl_anchor") is not None else torch.zeros((), device=mse_t.device)
+        loss = loss + self.cfg.anchor_prior * anchor
+        ls = out["latent_stats"]
+        names = ("post_logvar", "prior_logvar", "mean_gap", "post_mu_abs", "prior_mu_abs", "post_mu_spread")
+        lat = {k: (ls[i].item() if ls is not None else 0.0) for i, k in enumerate(names)}
         return loss, {"loss": loss.item(), "mse": mse_t.mean().item(), "mse_warm": mse_warm.item(),
-                      "kl": kl.item(), "prior_std": out["prior_std"].mean().item()}
+                      "kl": kl.item(), "kl_anchor": anchor.item(), "prior_std": out["prior_std"].mean().item()} | lat
 
     # ---- stage 2 initialisation ----------------------------------------------------------------------------------
     FRESH = ("prior.", "posterior.", "P_z.")

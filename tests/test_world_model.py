@@ -240,6 +240,8 @@ def test_beta_schedule():
     A = type("A", (), {"beta": 1e-4, "kl_warmup_steps": 1000})
     assert beta_at(0, A) == 0 and beta_at(999, A) == 0
     assert abs(beta_at(1500, A) - 5e-5) < 1e-12 and beta_at(2000, A) == 1e-4 and beta_at(9000, A) == 1e-4
+    A.beta_warmup = 1e-6                                              # small KL during the warm-up, then the ramp
+    assert beta_at(0, A) == 1e-6 and abs(beta_at(1500, A) - (1e-6 + (1e-4 - 1e-6) / 2)) < 1e-12
     A.kl_warmup_steps = 0
     assert beta_at(0, A) == 1e-4
 
