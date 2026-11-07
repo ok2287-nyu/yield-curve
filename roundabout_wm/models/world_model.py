@@ -63,6 +63,11 @@ class WMConfig:
     p_zdrop: float = 0.5        # probability of sampling z from the prior on a training step
     p_openloop: float = 0.0     # probability that a whole training sequence uses prior z at EVERY step (as in
                                 # validation and imagination); the rest use per-step z-dropout as above
+    best_of: int = 1            # > 1 (with p_openloop > 0): each open-loop sequence is rolled out best_of times
+                                # with independent prior samples and only the closest rollout (lowest MSE over the
+                                # whole sequence) gets the MSE: a "variety" / winner-takes-all loss. Fading is still
+                                # punished (a car lost in every sample is missed by the best one too) but averaging
+                                # futures is no longer rewarded (a committed right sample beats a blurred mean)
     beta: float = 1e-6          # KL weight, relative to a per-pixel MEAN squared error
     prior_sg: bool = True       # stop-gradient on prior samples during z-dropout training
     deterministic: bool = False  # stage 1: z = 0 always, no prior/posterior, no KL
@@ -259,7 +264,7 @@ class WorldModel(nn.Module):
         return h, hs
 
     # ---- full pass ----------------------------------------------------------------------------------------------
-    def forward(self, images, actions, speeds, n_pred, z_source="mix", z_seq=None):
+    def forward(self, images, actions, speeds, n_pred, z_source="mix", z_seq=None, open_loop=None):
         """images  (B, L, 3, 64, 64) in [0, 1]; for z_source "prior"/"given" only the first n_cond are read
         actions (B, L-1, 2) normalised; speeds (B, L, 1) normalised; act[i] moves frame i -> i+1
         z_source "mix"   training: posterior or (prob p_zdrop) prior, per sample and step
@@ -267,6 +272,7 @@ class WorldModel(nn.Module):
                  "prior" always the prior (open-loop evaluation, imagination)
                  "given" z_seq[k] (B, z_ch, 8, 8) at rollout step k (e.g. one z shared across dropout masks)
                  "zero"  z = 0 at every step (forced when cfg.deterministic)
+        open_loop (B,) bool, "mix" only: which sequences are fully open loop (default: drawn with cfg.p_openloop)
         Returns dict:
             green        (B, n_pred, 1, 64, 64)  predicted frames n_cond .. n_cond+n_pred-1
             green_warm   (B, n_cond, 1, 64, 64)  warm-up reconstructions of frames 0 .. n_cond-1
@@ -293,7 +299,7 @@ class WorldModel(nn.Module):
         anchors = []                                # KL(prior || N(0, I)) per step, if cfg.anchor_prior
         lat = []                                    # (posterior logvar, prior logvar, |mu_q - mu_p| / sigma_p) means
         B = h.shape[0]
-        if z_source == "mix":                       # which sequences are fully open loop (drawn once per sequence)
+        if z_source == "mix" and open_loop is None:  # which sequences are fully open loop (drawn once per sequence)
             open_loop = torch.rand(B, device=h.device) < cfg.p_openloop
         for k in range(n_pred):
             i = n - 1 + k                                                          # current frame; predict i+1
@@ -352,9 +358,26 @@ class WorldModel(nn.Module):
         `beta` overrides cfg.beta (used by the KL warm-up schedule in train_wm.py)."""
         n = self.cfg.n_cond
         imgs, act, spd = batch["images"], batch["actions"], batch["speed"]
-        out = self(imgs, act, spd, n_pred, z_source="mix")
-        tgt = imgs[:, n:n + n_pred, GREEN:GREEN + 1]
-        mse_t = ((out["green"].float() - tgt) ** 2).mean((0, 2, 3, 4))           # per rollout step
+        if self.cfg.best_of > 1 and self.cfg.p_openloop > 0 and not self.cfg.deterministic:
+            # open-loop sequences appear best_of times in an expanded batch (independent prior samples); the MSE
+            # uses only each sequence's closest copy. Warm-up MSE and KL: averaged over all rows of the batch.
+            B, K = imgs.shape[0], self.cfg.best_of
+            ol = torch.rand(B, device=imgs.device) < self.cfg.p_openloop
+            reps = torch.where(ol, K, 1)
+            idx = torch.repeat_interleave(torch.arange(B, device=imgs.device), reps)
+            imgs, act, spd = imgs[idx], act[idx], spd[idx]
+            out = self(imgs, act, spd, n_pred, z_source="mix", open_loop=ol[idx])
+            tgt = imgs[:, n:n + n_pred, GREEN:GREEN + 1]
+            se = ((out["green"].float() - tgt) ** 2).mean((2, 3, 4))           # (rows, n_pred)
+            with torch.no_grad():                                            # the closest copy of each sequence
+                start = torch.cumsum(reps, 0) - reps
+                seq = se.mean(1)
+                best = torch.stack([start[b] + seq[start[b]:start[b] + reps[b]].argmin() for b in range(B)])
+            mse_t = se[best].mean(0)                                          # per rollout step, B rows
+        else:
+            out = self(imgs, act, spd, n_pred, z_source="mix")
+            tgt = imgs[:, n:n + n_pred, GREEN:GREEN + 1]
+            mse_t = ((out["green"].float() - tgt) ** 2).mean((0, 2, 3, 4))       # per rollout step
         mse_warm = ((out["green_warm"].float() - imgs[:, :n, GREEN:GREEN + 1]) ** 2).mean()
         kl = out["kl"].mean() if out["kl"] is not None else torch.zeros((), device=mse_t.device)
         loss = mse_t.mean() + mse_warm + (self.cfg.beta if beta is None else beta) * kl

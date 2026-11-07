@@ -361,6 +361,32 @@ def test_global_z_ppuu_style():
         assert changed.float().mean() > 0.9
 
 
+
+def test_best_of_k_takes_the_closest_copy():
+    """--best_of K: open-loop sequences are rolled out K times and the MSE is that of the closest rollout, recomputed
+    here by hand with the same random numbers. Gradients reach the decoder; best_of = 1 keeps the old loss exactly."""
+    K, b = 3, _batch(4)
+    m = _model(p_openloop=1.0, best_of=K, dropout=0.0)
+    m.train()
+    torch.manual_seed(7)
+    loss, logs = m.loss(b, N_PRED)
+    torch.manual_seed(7)                                       # same random numbers, by hand
+    ol = torch.rand(B) < 1.0
+    idx = torch.arange(B).repeat_interleave(K)
+    out = m(b["images"][idx], b["actions"][idx], b["speed"][idx], N_PRED, z_source="mix", open_loop=ol[idx])
+    tgt = b["images"][idx][:, N_COND:N_COND + N_PRED, 1:2]
+    seq = ((out["green"] - tgt) ** 2).mean((1, 2, 3, 4)).view(B, K)
+    assert abs(logs["mse"] - seq.min(1).values.mean().item()) < 1e-6, (logs["mse"], seq)
+    assert logs["mse"] < seq.mean().item()                     # strictly better than an average copy here
+    loss.backward()
+    assert m.dec[-1].weight.grad.abs().sum() > 0
+    # best_of = 1 (or no open-loop sequences): the old code path, same loss for the same seed
+    for kw in ({"p_openloop": 0.5, "best_of": 1}, {"p_openloop": 0.0, "best_of": 4}):
+        m1, m2 = _model(p_openloop=kw["p_openloop"]), _model(**kw)
+        torch.manual_seed(3); l1, _ = m1.loss(b, N_PRED)
+        torch.manual_seed(3); l2, _ = m2.loss(b, N_PRED)
+        assert torch.allclose(l1, l2), kw
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
