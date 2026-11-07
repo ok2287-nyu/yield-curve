@@ -268,8 +268,11 @@ class WorldModel(nn.Module):
                 mu_q, lv_q = self.posterior(torch.cat([h, e[:, i + 1]], 1))
                 kls.append(gauss_kl(mu_q, lv_q, mu_p, lv_p))
                 with torch.no_grad():
-                    lat.append(torch.stack([lv_q.float().mean(), lv_p.float().mean(),
-                                            ((mu_q - mu_p).abs() / (0.5 * lv_p).exp()).float().mean()]))
+                    lat.append(torch.stack([
+                        lv_q.float().mean(), lv_p.float().mean(),
+                        ((mu_q - mu_p).abs() / (0.5 * lv_p).exp()).float().mean(),
+                        mu_q.float().abs().mean(), mu_p.float().abs().mean(),
+                        mu_q.float().std(0).mean() if B > 1 else mu_q.new_zeros((), dtype=torch.float32)]))
                 z_q = self._sample(mu_q, lv_q)
             if z_source == "mix":
                 z_p = self._sample(mu_p, lv_p, detach=cfg.prior_sg)
@@ -306,8 +309,8 @@ class WorldModel(nn.Module):
         kl = out["kl"].mean() if out["kl"] is not None else torch.zeros((), device=mse_t.device)
         loss = mse_t.mean() + mse_warm + (self.cfg.beta if beta is None else beta) * kl
         ls = out["latent_stats"]
-        lat = {"post_logvar": ls[0].item(), "prior_logvar": ls[1].item(), "mean_gap": ls[2].item()} if ls is not None \
-            else {"post_logvar": 0.0, "prior_logvar": 0.0, "mean_gap": 0.0}
+        names = ("post_logvar", "prior_logvar", "mean_gap", "post_mu_abs", "prior_mu_abs", "post_mu_spread")
+        lat = {k: (ls[i].item() if ls is not None else 0.0) for i, k in enumerate(names)}
         return loss, {"loss": loss.item(), "mse": mse_t.mean().item(), "mse_warm": mse_warm.item(),
                       "kl": kl.item(), "prior_std": out["prior_std"].mean().item()} | lat
 

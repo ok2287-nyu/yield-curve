@@ -74,6 +74,9 @@ def args_():
     p.add_argument("--best_metric", choices=["auto", "prior", "elbo"], default="auto",
                    help="what best.pt minimises: auto = prior MSE for deterministic runs, validation ELBO for "
                         "stochastic runs (see selection_score)")
+    p.add_argument("--beta_warmup", type=float, default=0.0,
+                   help="KL weight during the warm-up phase (default 0: the KL is free; a small value keeps the "
+                        "posterior's means from running away from the prior)")
     p.add_argument("--kl_warmup_steps", type=int, default=0,
                    help="beta = 0 for this many steps, then a linear ramp to --beta over the same number of steps")
     p.add_argument("--init_from", default=None,
@@ -161,11 +164,12 @@ def selection_score(v, a, deterministic: bool) -> float:
 
 
 def beta_at(step: int, a) -> float:
-    """KL weight at a training step: 0 for kl_warmup_steps, then a linear ramp to a.beta over kl_warmup_steps."""
-    w = a.kl_warmup_steps
+    """KL weight at a training step: a.beta_warmup (default 0) for kl_warmup_steps, then a linear ramp to a.beta over
+    kl_warmup_steps."""
+    w, b0 = a.kl_warmup_steps, getattr(a, "beta_warmup", 0.0)
     if w <= 0 or step >= 2 * w:
         return a.beta
-    return 0.0 if step < w else a.beta * (step - w) / w
+    return b0 if step < w else b0 + (a.beta - b0) * (step - w) / w
 
 
 def to(batch, dev):
@@ -267,8 +271,8 @@ def gpu_util():
         return ""
 
 
-LOG_FIELDS = (["step", "split", "loss", "mse", "mse_warm", "kl", "prior_std", "post_logvar", "prior_logvar",
-               "mean_gap", "act_sens", "gap_mean", "s_per_step",
+LOG_FIELDS = (["step", "split", "beta", "loss", "mse", "mse_warm", "kl", "prior_std", "post_logvar", "prior_logvar",
+               "mean_gap", "post_mu_abs", "prior_mu_abs", "post_mu_spread", "act_sens", "gap_mean", "s_per_step",
                "gpu_util", "time", "elbo"]
               + [f"{m}@{k}" for k in REPORT_STEPS for m in ("prior", "post", "empty", "copy", "warp", "mass", "kl",
                                                              "std", "spread", "sharp")])
@@ -402,7 +406,8 @@ def main():
     use_amp = dev == "cuda" and torch.cuda.get_device_capability()[0] >= 8
     if dev == "cuda":
         print(f"GPU {torch.cuda.get_device_name()} | {'bf16 autocast' if use_amp else 'fp32 (no native bf16)'}")
-    keys = ("loss", "mse", "mse_warm", "kl", "prior_std", "post_logvar", "prior_logvar", "mean_gap")
+    keys = ("loss", "mse", "mse_warm", "kl", "prior_std", "post_logvar", "prior_logvar", "mean_gap", "post_mu_abs",
+            "prior_mu_abs", "post_mu_spread")
     last_ckpt, t0 = time.time(), time.time()
     run = {k: 0.0 for k in keys}; run_n = 0
     model.train()
@@ -428,8 +433,9 @@ def main():
                 sps = (time.time() - t0) / run_n
                 gu = gpu_util()
                 print(f"step {step} | beta {beta_at(step, a):.1e} | loss {m['loss']:.5f} mse {m['mse']:.5f} warm {m['mse_warm']:.5f} "
-                      f"kl {m['kl']:.1f} prior_std {m['prior_std']:.3f} | {sps:.3f} s/step gpu {gu}%")
-                log.writerow({"step": step, "split": "train", **m, "s_per_step": sps, "gpu_util": gu,
+                      f"kl {m['kl']:.1f} prior_std {m['prior_std']:.3f} | logvar post {m['post_logvar']:.2f} "
+                      f"prior {m['prior_logvar']:.2f} | {sps:.3f} s/step gpu {gu}%")
+                log.writerow({"step": step, "split": "train", "beta": beta_at(step, a), **m, "s_per_step": sps, "gpu_util": gu,
                               "time": time.time()})
                 log_f.flush()
                 wb.log({f"train/{k}": x for k, x in m.items()} | {"train/s_per_step": sps, "train/gpu_util": gu},
