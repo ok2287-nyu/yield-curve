@@ -74,6 +74,9 @@ def args_():
     p.add_argument("--best_metric", choices=["auto", "prior", "elbo"], default="auto",
                    help="what best.pt minimises: auto = prior MSE for deterministic runs, validation ELBO for "
                         "stochastic runs (see selection_score)")
+    p.add_argument("--anchor_prior", type=float, default=0.0,
+                   help="weight of KL(prior || N(0, I)): pins the latent's scale (e.g. 1e-6); 0 = off")
+    p.add_argument("--no_decay_pz", action="store_true", help="no weight decay on P_z (see the optimizer comment)")
     p.add_argument("--beta_warmup", type=float, default=0.0,
                    help="KL weight during the warm-up phase (default 0: the KL is free; a small value keeps the "
                         "posterior's means from running away from the prior)")
@@ -271,7 +274,7 @@ def gpu_util():
         return ""
 
 
-LOG_FIELDS = (["step", "split", "beta", "loss", "mse", "mse_warm", "kl", "prior_std", "post_logvar", "prior_logvar",
+LOG_FIELDS = (["step", "split", "beta", "loss", "mse", "mse_warm", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar",
                "mean_gap", "post_mu_abs", "prior_mu_abs", "post_mu_spread", "act_sens", "gap_mean", "s_per_step",
                "gpu_util", "time", "elbo"]
               + [f"{m}@{k}" for k in REPORT_STEPS for m in ("prior", "post", "empty", "copy", "warp", "mass", "kl",
@@ -351,13 +354,19 @@ def main():
 
     wm_cfg = WMConfig(encoder=a.encoder, n_cond=cfg.data.n_cond, z_ch=a.z_ch, dropout=a.dropout,
                       p_zdrop=a.p_zdrop, beta=a.beta, prior_sg=a.prior_sg, deterministic=a.deterministic,
-                      p_openloop=a.p_openloop, residual=a.residual, reencode=a.reencode)
+                      p_openloop=a.p_openloop, residual=a.residual, reencode=a.reencode,
+                      anchor_prior=a.anchor_prior)
     model = WorldModel(wm_cfg).to(dev)
     enc_params = list(model.encoder.parameters())
     enc_ids = {id(p) for p in enc_params}
-    opt = torch.optim.AdamW([{"params": [p for p in model.parameters() if id(p) not in enc_ids]},
-                             {"params": enc_params, "lr": a.lr * a.enc_lr_mult}],
-                            lr=a.lr, weight_decay=a.weight_decay)
+    # --no_decay_pz: no weight decay on P_z. z's scale is free (P_z is linear), so decay shrinking P_z can be undone
+    # for free by a larger z: decay then pushes the latent's means and variances up, towards the log-variance cap.
+    pz_ids = {id(p) for p in model.P_z.parameters()} if a.no_decay_pz else set()
+    groups = [{"params": [p for p in model.parameters() if id(p) not in enc_ids | pz_ids]},
+              {"params": enc_params, "lr": a.lr * a.enc_lr_mult}]
+    if pz_ids:
+        groups.append({"params": list(model.P_z.parameters()), "weight_decay": 0.0})
+    opt = torch.optim.AdamW(groups, lr=a.lr, weight_decay=a.weight_decay)
     pc = param_counts(model)
     print("params (M): " + ", ".join(f"{k} {v / 1e6:.2f}" for k, v in pc.items()))
     json.dump(pc, open(os.path.join(out_dir, "params.json"), "w"), indent=1)
@@ -406,7 +415,7 @@ def main():
     use_amp = dev == "cuda" and torch.cuda.get_device_capability()[0] >= 8
     if dev == "cuda":
         print(f"GPU {torch.cuda.get_device_name()} | {'bf16 autocast' if use_amp else 'fp32 (no native bf16)'}")
-    keys = ("loss", "mse", "mse_warm", "kl", "prior_std", "post_logvar", "prior_logvar", "mean_gap", "post_mu_abs",
+    keys = ("loss", "mse", "mse_warm", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar", "mean_gap", "post_mu_abs",
             "prior_mu_abs", "post_mu_spread")
     last_ckpt, t0 = time.time(), time.time()
     run = {k: 0.0 for k in keys}; run_n = 0
