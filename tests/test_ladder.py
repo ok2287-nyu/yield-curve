@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from ladder import RUNGS, SUMS, owner_map, rungs, score_step, summarize, window_geometry
+from ladder import RUNGS, SUMS, owner_map, rungs, scheduled_rollout, score_step, summarize, window_geometry
 from roundabout_wm.config import Config
 from roundabout_wm.models.world_model import WMConfig, WorldModel
 
@@ -108,7 +108,7 @@ def test_rungs_shapes_and_deterministic_post_equals_prior():
         torch.manual_seed(0)
         m = WorldModel(WMConfig(n_cond=n, **kw)).eval()
         out = rungs(m, b, n, T, k=2)
-        assert set(out) == set(RUNGS) and len(out["roll_prior"]) == 2
+        assert set(out) == set(RUNGS) and len(out["roll_prior"]) == 2 and len(out["mix_L1"]) == 2
         for r, preds in out.items():
             for p in preds:
                 assert p.shape == (2, T, 64, 64), (kw, r, p.shape)
@@ -118,6 +118,28 @@ def test_rungs_shapes_and_deterministic_post_equals_prior():
             # the first target: one-step and rollout both start from h_{n-1} after the real warm-up
             assert torch.allclose(out["1step_post"][0][:, 0], out["roll_post"][0][:, 0], atol=1e-5)
             assert not torch.allclose(out["1step_post"][0][:, 1:], out["roll_post"][0][:, 1:])
+
+
+
+def test_scheduled_rollout_matches_forward():
+    """All-posterior / all-prior schedules reproduce forward(z_source=...) exactly (same random numbers)."""
+    cfg = Config()
+    n, T = cfg.data.n_cond, 5
+    g = torch.Generator().manual_seed(1)
+    b = {"images": (torch.rand(2, n + T, 3, 64, 64, generator=g) > 0.9).float(),
+         "actions": torch.randn(2, n + T - 1, 2, generator=g), "speed": torch.randn(2, n + T, 1, generator=g)}
+    for kw in ({}, {"z_global": 8}, {"reencode": True, "residual": True}, {"deterministic": True}):
+        torch.manual_seed(0)
+        m = WorldModel(WMConfig(n_cond=n, **kw)).eval()
+        for src in ("post", "prior"):
+            torch.manual_seed(3); ref = m(b["images"], b["actions"], b["speed"], T, z_source=src)["green"][:, :, 0]
+            torch.manual_seed(3); got = scheduled_rollout(m, b, n, T, lambda k: src)
+            assert torch.allclose(ref, got, atol=1e-6), (kw, src)
+        mean = scheduled_rollout(m, b, n, T, lambda k: "pmean")
+        assert torch.allclose(mean, scheduled_rollout(m, b, n, T, lambda k: "pmean"))     # no sampling
+        if not kw:                                                                         # mixed schedule differs
+            torch.manual_seed(3); mix = scheduled_rollout(m, b, n, T, lambda k: "post" if k % 2 == 1 else "prior")
+            assert not torch.allclose(mix, ref)
 
 
 if __name__ == "__main__":

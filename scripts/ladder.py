@@ -12,6 +12,11 @@ Rungs (all predict the SAME target frames n .. n+T-1, so columns are comparable)
     roll_post    20-step rollout from the warm-up, z from the posterior at every step: memory in h over many
                  steps, given the right latent
     roll_prior   20-step rollout, prior samples (what a controller gets); --k samples per window
+    roll_pmean   20-step rollout with the prior MEAN (no sampling): cars kept here but not in roll_prior = the
+                 sampling noise damages h; lost here too = the prior's mean itself is wrong
+    mix_L<L>     20-step rollout, L prior samples then 1 posterior step, repeated (L = 1, 2, 5, 10):
+                 cars kept at small L but lost at large L = the model never practises long runs of prior steps
+                 (training's z-dropout gives runs of ~1-2); lost at every L = the prior is wrong more basically
 A drop between two rungs points at the part that rung adds. Deterministic models: post = prior (z = 0).
 
 Scoring per target frame (all geometry in the logged ego pose of that frame, from the raw rounD tracks):
@@ -53,7 +58,9 @@ from roundabout_wm.models.world_model import GREEN, WMConfig, WorldModel
 from roundabout_wm.render import car_corners, render_frame
 
 REPORT = (1, 5, 10, 20)
-RUNGS = ("truth", "recon", "1step_post", "1step_prior", "roll_post", "roll_prior")
+BASE_RUNGS = ("truth", "recon", "1step_post", "1step_prior", "roll_post", "roll_prior", "roll_pmean")
+MIX_L = (1, 2, 5, 10)
+RUNGS = BASE_RUNGS + tuple(f"mix_L{L}" for L in MIX_L)
 SUMS = ("kept_num", "kept_den", "n_car", "n_faded", "n_blob1", "n_split", "n_lost", "sq", "s", "sq_t", "s_t",
         "invented", "true_all", "arr_num", "arr_den", "lead_num", "lead_den", "n_lead", "n_lead_split")
 
@@ -170,7 +177,39 @@ def window_geometry(win, st, cfg, meta, tol, dilate, lead_ahead=25.0, lead_side=
 
 # ---- model rungs -------------------------------------------------------------------------------------------------
 @torch.no_grad()
-def rungs(m, b, n, T, k):
+def scheduled_rollout(m, b, n, T, source):
+    """Rollout like WorldModel.forward, but z at step k comes from source(k) in {"post", "prior", "pmean"}.
+    Same random-number use as forward() for all-"post" / all-"prior" schedules (tested). -> (B, T, 64, 64)."""
+    imgs, act, spd = b["images"], b["actions"], b["speed"]
+    B = imgs.shape[0]
+    e = m.encode(imgs[:, :n + T])
+    h, _ = m.warmup(e[:, :n], act, spd)
+    prev = imgs[:, n - 1, GREEN:GREEN + 1]
+    out = []
+    for k in range(T):
+        i = n - 1 + k
+        frame = None
+        if m.cfg.reencode:
+            frame = imgs[:, i] if k == 0 else torch.cat([imgs[:, i, :GREEN], prev.to(imgs.dtype),
+                                                         imgs[:, i, GREEN + 1:]], 1)
+        if m.cfg.deterministic:
+            z = m.zero_z(B, h.device)
+        else:
+            src = source(k)
+            mu_p, lv_p = m.prior(h)
+            if src == "post":
+                z = m._sample(*m.posterior(torch.cat([h, e[:, i + 1]], 1)))
+            elif src == "prior":
+                z = m._sample(mu_p, lv_p)
+            else:
+                z = mu_p
+        h, g = m.rollout_step(h, z, act[:, i], spd[:, i], frame, prev)
+        out.append(g); prev = g
+    return torch.stack(out, 1)[:, :, 0].float()
+
+
+@torch.no_grad()
+def rungs(m, b, n, T, k, mix_L=MIX_L):
     """-> dict rung -> list of (B, T, 64, 64) predictions (one per sample)."""
     imgs, act, spd = b["images"], b["actions"], b["speed"]
     B, det = imgs.shape[0], m.cfg.deterministic
@@ -196,6 +235,10 @@ def rungs(m, b, n, T, k):
     out["1step_prior"] = [one("prior")]
     out["roll_post"] = [m(imgs, act, spd, T, z_source="post")["green"][:, :, 0].float()]
     out["roll_prior"] = [m(imgs, act, spd, T, z_source="prior")["green"][:, :, 0].float() for _ in range(k)]
+    out["roll_pmean"] = [scheduled_rollout(m, b, n, T, lambda s: "pmean")]
+    for L in mix_L:                                   # L prior steps, then one posterior step, repeated
+        out[f"mix_L{L}"] = [scheduled_rollout(m, b, n, T, lambda s, L=L: "post" if s % (L + 1) == L else "prior")
+                            for _ in range(k)]
     return out
 
 
