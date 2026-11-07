@@ -131,7 +131,7 @@ class ImaginedDrive:
                            dtype=torch.float32, device=self.dev)
         m = self.model
         if m.cfg.deterministic:
-            z = torch.zeros(1, m.cfg.z_ch, 8, 8, device=self.dev)
+            z = m.zero_z(1, self.dev)
         else:
             mu, lv = m.prior(self.h)
             z = mu + (0.5 * lv).exp() * torch.randn(mu.shape, generator=self.gen, device=self.dev)
