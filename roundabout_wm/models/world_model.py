@@ -56,6 +56,9 @@ class WMConfig:
     n_cond: int = 10
     hidden: int = 256
     z_ch: int = 8               # latent channels per 6 m cell -> z is z_ch x 8 x 8 = 512 numbers
+    z_global: int = 0           # > 0: PPUU-style 1-D z of this many numbers instead (pytorch-PPUU FwdCNN_VAE: heads
+                                # on the flattened hidden state, z_expander = one Linear(nz -> whole hidden map));
+                                # every number can act on every location. 0 = the spatial z above
     dropout: float = 0.1        # Dropout2d in Pred (input u, output h) and Dec; NOT in the encoder or the prior head
     p_zdrop: float = 0.5        # probability of sampling z from the prior on a training step
     p_openloop: float = 0.0     # probability that a whole training sequence uses prior z at EVERY step (as in
@@ -140,6 +143,35 @@ class GaussHead(nn.Module):
         return mu, lv.clamp(self.lv_min, self.lv_max)
 
 
+class GlobalGaussHead(nn.Module):
+    """PPUU-style head on the flattened hidden map: Linear(in -> hidden), LeakyReLU, Linear(hidden -> hidden),
+    LeakyReLU, Linear(hidden -> 2*nz) -> (mu, logvar), each (B, nz). Last layer in fp32, log-variance clamped."""
+
+    def __init__(self, in_feat: int, hidden: int, nz: int, lv_min: float, lv_max: float):
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(in_feat, hidden), nn.LeakyReLU(0.2),
+                                  nn.Linear(hidden, hidden), nn.LeakyReLU(0.2))
+        self.out = nn.Linear(hidden, 2 * nz)
+        self.lv_min, self.lv_max = lv_min, lv_max
+
+    def forward(self, x):
+        y = self.body(x.flatten(1))
+        with torch.autocast(device_type=y.device.type, enabled=False):
+            mu, lv = self.out(y.float()).chunk(2, 1)
+        return mu, lv.clamp(self.lv_min, self.lv_max)
+
+
+class ZExpander(nn.Module):
+    """PPUU's z_expander: one Linear(nz -> C*8*8), reshaped to the hidden map (B, C, 8, 8)."""
+
+    def __init__(self, nz: int, C: int):
+        super().__init__()
+        self.lin, self.C = nn.Linear(nz, C * 64), C
+
+    def forward(self, z):
+        return self.lin(z).view(z.shape[0], self.C, 8, 8)
+
+
 def gauss_kl(mu_q, lv_q, mu_p, lv_p):
     """KL(q || p) for diagonal Gaussians, summed over every latent element (z_ch x 8 x 8) -> (B,). fp32."""
     mu_q, lv_q, mu_p, lv_p = (t.float() for t in (mu_q, lv_q, mu_p, lv_p))
@@ -154,11 +186,16 @@ class WorldModel(nn.Module):
         C, Z, p = cfg.hidden, cfg.z_ch, cfg.dropout
         self.encoder = build_encoder(cfg.encoder, C)                               # Enc: the only part that differs
         self.P_e = nn.Conv2d(C, C, 1)                                              # encoder -> Pred input (warm-up)
-        self.P_z = nn.Conv2d(Z, C, 1)                                              # z -> Pred input, per cell
+        G = cfg.z_global
+        self.P_z = ZExpander(G, C) if G else nn.Conv2d(Z, C, 1)                    # z -> Pred input
         self.A = nn.Sequential(nn.Linear(3, C), nn.LeakyReLU(0.2), nn.Linear(C, C * 64))  # (acc, curv, v) -> 256x8x8
         self.pred = ConvGRUCell(C, 3, p)                                           # Pred
-        self.prior = GaussHead(C, C, Z, cfg.logvar_min, cfg.logvar_max)
-        self.posterior = GaussHead(2 * C, C, Z, cfg.logvar_min, cfg.logvar_max)
+        if G:
+            self.prior = GlobalGaussHead(C * 64, C, G, cfg.logvar_min, cfg.logvar_max)
+            self.posterior = GlobalGaussHead(2 * C * 64, C, G, cfg.logvar_min, cfg.logvar_max)
+        else:
+            self.prior = GaussHead(C, C, Z, cfg.logvar_min, cfg.logvar_max)
+            self.posterior = GaussHead(2 * C, C, Z, cfg.logvar_min, cfg.logvar_max)
         self.dec = nn.Sequential(                                                  # Dec: 8 -> 16 -> 32 -> 64, green only
             nn.Conv2d(C, C, 3, padding=1), nn.GroupNorm(8, C), nn.LeakyReLU(0.2), StickyDropout2d(p),
             nn.ConvTranspose2d(C, 128, 4, 2, 1), nn.GroupNorm(8, 128), nn.LeakyReLU(0.2), StickyDropout2d(p),
@@ -174,6 +211,11 @@ class WorldModel(nn.Module):
     def action_map(self, act, spd):
         """act (B, 2) normalised (acc, curv); spd (B, 1) normalised speed -> (B, C, 8, 8)."""
         return self.A(torch.cat([act, spd], -1)).view(act.shape[0], self.cfg.hidden, 8, 8)
+
+    def zero_z(self, B, device):
+        """z = 0 in this model's latent shape: (B, z_global) or (B, z_ch, 8, 8)."""
+        G = self.cfg.z_global
+        return torch.zeros(B, G, device=device) if G else torch.zeros(B, self.cfg.z_ch, 8, 8, device=device)
 
     def decode(self, h, prev=None):
         """(B, 1, 64, 64). prev: the previous green frame (B, 1, 64, 64), added to the logits if cfg.residual."""
@@ -260,7 +302,7 @@ class WorldModel(nn.Module):
                 frame = images[:, i] if k == 0 else torch.cat(
                     [images[:, i, :GREEN], prev.to(images.dtype), images[:, i, GREEN + 1:]], 1)
             if z_source == "zero":                  # deterministic: no heads run, z = 0 (P_z(0) = its bias only)
-                z = torch.zeros(B, cfg.z_ch, 8, 8, device=h.device)
+                z = self.zero_z(B, h.device)
                 h, g = self.rollout_step(h, z, actions[:, i], speeds[:, i], frame, prev)
                 greens.append(g); prev = g
                 stds.append(torch.zeros(B, device=h.device)); std_maps.append(torch.zeros(B, 8, 8, device=h.device))
@@ -281,7 +323,8 @@ class WorldModel(nn.Module):
                 z_q = self._sample(mu_q, lv_q)
             if z_source == "mix":
                 z_p = self._sample(mu_p, lv_p, detach=cfg.prior_sg)
-                use_prior = ((torch.rand(B, device=h.device) < cfg.p_zdrop) | open_loop)[:, None, None, None]
+                use_prior = ((torch.rand(B, device=h.device) < cfg.p_zdrop) | open_loop)
+                use_prior = use_prior.view(B, *([1] * (z_p.dim() - 1)))
                 z = torch.where(use_prior, z_p, z_q)
             elif z_source == "post":
                 z = z_q
@@ -294,7 +337,8 @@ class WorldModel(nn.Module):
             h, g = self.rollout_step(h, z, actions[:, i], speeds[:, i], frame, prev)
             greens.append(g); prev = g
             sd = (0.5 * lv_p).exp()
-            stds.append(sd.flatten(1).mean(1)); std_maps.append(sd.mean(1))
+            stds.append(sd.flatten(1).mean(1))
+            std_maps.append(sd.mean(1) if sd.dim() == 4 else sd.mean(1)[:, None, None].expand(B, 8, 8))
             zs.append(z.detach())
         return {"green": torch.stack(greens, 1), "green_warm": green_warm,
                 "kl": torch.stack(kls, 1) if kls else None,
@@ -340,9 +384,16 @@ class WorldModel(nn.Module):
             raise KeyError(f"warm start checkpoint lacks {missing[:5]} ... (different encoder or sizes?)")
         self.load_state_dict(keep, strict=False)
         with torch.no_grad():
-            fresh = nn.Conv2d(self.cfg.z_ch, self.cfg.hidden, 1).to(self.P_z.weight.device)  # default init
-            self.P_z.weight.copy_(fresh.weight * pz_init_scale)
-            self.P_z.bias.copy_(state_dict["P_z.bias"])                       # P_z(0) = stage-1's P_z(0)
+            C = self.cfg.hidden
+            if self.cfg.z_global:                   # stage 1 had the spatial P_z; P_z(0) = its bias at every cell
+                fresh = nn.Linear(self.cfg.z_global, C * 64).to(self.P_z.lin.weight.device)
+                self.P_z.lin.weight.copy_(fresh.weight * pz_init_scale)
+                b = state_dict.get("P_z.bias", state_dict.get("P_z.lin.bias"))
+                self.P_z.lin.bias.copy_(b.view(C, 1, 1).expand(C, 8, 8).reshape(-1) if b.numel() == C else b)
+            else:
+                fresh = nn.Conv2d(self.cfg.z_ch, C, 1).to(self.P_z.weight.device)   # default init
+                self.P_z.weight.copy_(fresh.weight * pz_init_scale)
+                self.P_z.bias.copy_(state_dict["P_z.bias"])                   # P_z(0) = stage-1's P_z(0)
         return sorted(keep)
 
     # ---- epistemic helper (for the policy later) ---------------------------------------------------------------

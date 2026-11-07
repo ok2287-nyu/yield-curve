@@ -93,6 +93,8 @@ def args_():
     p.add_argument("--beta", type=float, default=1e-6)
     p.add_argument("--p_zdrop", type=float, default=0.5)
     p.add_argument("--z_ch", type=int, default=8)
+    p.add_argument("--z_global", type=int, default=0,
+                   help="> 0: PPUU-style 1-D z with this many numbers (e.g. 32) instead of the spatial z_ch x 8 x 8")
     p.add_argument("--residual", action="store_true",
                    help="decoder adds the previous green frame to its logits (PPUU): cars carry over by default")
     p.add_argument("--reencode", action="store_true",
@@ -355,7 +357,7 @@ def main():
     wm_cfg = WMConfig(encoder=a.encoder, n_cond=cfg.data.n_cond, z_ch=a.z_ch, dropout=a.dropout,
                       p_zdrop=a.p_zdrop, beta=a.beta, prior_sg=a.prior_sg, deterministic=a.deterministic,
                       p_openloop=a.p_openloop, residual=a.residual, reencode=a.reencode,
-                      anchor_prior=a.anchor_prior)
+                      anchor_prior=a.anchor_prior, z_global=a.z_global)
     model = WorldModel(wm_cfg).to(dev)
     enc_params = list(model.encoder.parameters())
     enc_ids = {id(p) for p in enc_params}

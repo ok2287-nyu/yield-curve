@@ -337,6 +337,30 @@ def test_reencode_needs_future_road_frames():
     raise AssertionError("reencode with only warm-up frames should raise")
 
 
+def test_global_z_ppuu_style():
+    """--z_global: z is (B, nz); loss/backward run; every forward mode works; warm start from a spatial stage-1
+    model with P_z scale 0 reproduces stage 1 exactly; one z number changes the whole hidden map (non-local)."""
+    b = _batch()
+    m = _model(z_global=32)
+    m.train(); loss, _ = m.loss(b, N_PRED); loss.backward()
+    assert all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
+    m.eval()
+    with torch.no_grad():
+        for src in ("prior", "post", "zero"):
+            o = m(b["images"], b["actions"], b["speed"], N_PRED, z_source=src)
+            assert o["green"].shape[:2] == (b["images"].shape[0], N_PRED)
+        assert o["z"][0].shape == (b["images"].shape[0], 32)
+    det = _model(deterministic=True).eval()
+    g = _model(z_global=32); g.load_warm_start(det.state_dict(), pz_init_scale=0.0); g.eval()
+    with torch.no_grad():
+        a = det(b["images"], b["actions"], b["speed"], N_PRED, z_source="zero")["green"]
+        c = g(b["images"], b["actions"], b["speed"], N_PRED, z_source="zero")["green"]
+        assert torch.equal(a, c)
+        dz = torch.zeros(1, 32); dz[0, 0] = 1.0                      # one number -> changes at many cells
+        changed = (m.P_z(dz) - m.P_z(torch.zeros(1, 32))).abs().sum(1)[0] > 0
+        assert changed.float().mean() > 0.9
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
