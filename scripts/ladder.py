@@ -46,7 +46,6 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
-from scipy.ndimage import distance_transform_edt
 
 from roundabout_wm.config import Config
 from roundabout_wm.dataset import RounDWindows
@@ -80,7 +79,8 @@ def owner_map(footprints, corridors):
     d = np.full((len(footprints), H, W), np.inf, np.float32)
     for c, (f, cor) in enumerate(zip(footprints, corridors)):
         m = f > 0.1
-        dist = distance_transform_edt(~m) if m.any() else np.full((H, W), 1e3, np.float32)
+        dist = (cv2.distanceTransform((~m).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE) if m.any()
+                else np.full((H, W), 1e3, np.float32))
         d[c][cor] = dist[cor]
     own = d.argmin(0)
     own[~np.isfinite(d.min(0))] = -1
