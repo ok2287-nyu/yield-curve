@@ -196,7 +196,7 @@ def scheduled_rollout(m, b, n, T, source):
             z = m.zero_z(B, h.device)
         else:
             src = source(k)
-            mu_p, lv_p = m.prior(h)
+            mu_p, lv_p = m.prior_params(h)
             if src == "post":
                 z = m._sample(*m.posterior(torch.cat([h, e[:, i + 1]], 1)))
             elif src == "prior":
@@ -229,7 +229,7 @@ def rungs(m, b, n, T, k, mix_L=MIX_L):
         elif source == "post":
             z = m._sample(*m.posterior(torch.cat([H, e[:, n:n + T].flatten(0, 1)], 1)))
         else:
-            z = m._sample(*m.prior(H))
+            z = m._sample(*m.prior_params(H))
         return m.rollout_step(H, z, a1, s1, fr, prev)[1].float().view(B, T, 64, 64)
     out["1step_post"] = [one("post")]
     out["1step_prior"] = [one("prior")]

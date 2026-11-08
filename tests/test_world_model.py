@@ -387,6 +387,28 @@ def test_best_of_k_takes_the_closest_copy():
         torch.manual_seed(3); l2, _ = m2.loss(b, N_PRED)
         assert torch.allclose(l1, l2), kw
 
+
+def test_fixed_prior_is_standard_normal():
+    """--fixed_prior: p(z) = N(0, I) for any h (spatial and 1-D z): the KL is KL(q || N(0, I)), prior rollouts do not
+    depend on the prior head, and the default (learned prior) is unchanged."""
+    b = _batch(2)
+    for G in (0, 8):
+        m = _model(fixed_prior=True, z_global=G).eval()
+        h = torch.randn(B, 256, 8, 8)
+        mu, lv = m.prior_params(h)
+        assert mu.abs().sum() == 0 and lv.abs().sum() == 0 and mu.shape == m.zero_z(B, "cpu").shape
+        torch.manual_seed(1); g1 = m(b["images"], b["actions"], b["speed"], N_PRED, z_source="prior")["green"]
+        with torch.no_grad():
+            for p in m.prior.parameters():
+                p.add_(1.0)                                     # the prior head must not matter
+        torch.manual_seed(1); g2 = m(b["images"], b["actions"], b["speed"], N_PRED, z_source="prior")["green"]
+        assert torch.equal(g1, g2)
+        out = m(b["images"], b["actions"], b["speed"], N_PRED, z_source="post")
+        assert out["kl"].min() >= 0
+    m0 = _model().eval()
+    h = torch.randn(B, 256, 8, 8)
+    assert torch.equal(m0.prior_params(h)[0], m0.prior(h)[0])
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
