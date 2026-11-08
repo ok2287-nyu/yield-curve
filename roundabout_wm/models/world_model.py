@@ -78,6 +78,8 @@ class WMConfig:
     reencode: bool = False      # PPUU-style: each rollout step also reads the CURRENT frame through the encoder
                                 # (real road and ego channels, the model's own predicted green), so the model re-reads
                                 # the cars it drew; needs the window's road/ego frames up to n_cond + n_pred - 1
+    fixed_prior: bool = False   # PPUU's fwd-cnn-vae-fp: p(z) = N(0, I) whatever h is (the prior head is unused).
+                                # Tests whether the learned, h-dependent prior is what loses cars in prior rollouts
     logvar_min: float = -8.0
     logvar_max: float = 6.0
 
@@ -241,6 +243,13 @@ class WorldModel(nn.Module):
         h = self.pred(h, u)
         return h, self.decode(h, prev)
 
+    def prior_params(self, h):
+        """(mu_p, logvar_p) of p(z | h): the learned prior head, or N(0, I) if cfg.fixed_prior."""
+        if self.cfg.fixed_prior:
+            z = self.zero_z(h.shape[0], h.device)
+            return z, torch.zeros_like(z)
+        return self.prior(h)
+
     def _sample(self, mu, lv, detach=False):
         if detach:
             mu, lv = mu.detach(), lv.detach()
@@ -314,7 +323,7 @@ class WorldModel(nn.Module):
                 stds.append(torch.zeros(B, device=h.device)); std_maps.append(torch.zeros(B, 8, 8, device=h.device))
                 zs.append(z)
                 continue
-            mu_p, lv_p = self.prior(h)
+            mu_p, lv_p = self.prior_params(h)
             if use_post:
                 mu_q, lv_q = self.posterior(torch.cat([h, e[:, i + 1]], 1))
                 kls.append(gauss_kl(mu_q, lv_q, mu_p, lv_p))

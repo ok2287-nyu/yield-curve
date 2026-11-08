@@ -101,6 +101,8 @@ def args_():
                    help="each rollout step re-reads the current frame (with the model's own green) through the encoder")
     p.add_argument("--p_openloop", type=float, default=0.0,
                    help="share of training sequences that use prior z at every step (tests exposure bias)")
+    p.add_argument("--fixed_prior", action="store_true",
+                   help="p(z) = N(0, I) instead of the learned prior head (PPUU fwd-cnn-vae-fp)")
     p.add_argument("--best_of", type=int, default=1,
                    help="> 1 with --p_openloop: K prior rollouts per open-loop sequence, MSE only on the closest "
                         "(variety loss: punishes fading without rewarding blur)")
@@ -360,7 +362,8 @@ def main():
     wm_cfg = WMConfig(encoder=a.encoder, n_cond=cfg.data.n_cond, z_ch=a.z_ch, dropout=a.dropout,
                       p_zdrop=a.p_zdrop, beta=a.beta, prior_sg=a.prior_sg, deterministic=a.deterministic,
                       p_openloop=a.p_openloop, residual=a.residual, reencode=a.reencode,
-                      anchor_prior=a.anchor_prior, z_global=a.z_global, best_of=a.best_of)
+                      anchor_prior=a.anchor_prior, z_global=a.z_global, best_of=a.best_of,
+                      fixed_prior=a.fixed_prior)
     model = WorldModel(wm_cfg).to(dev)
     enc_params = list(model.encoder.parameters())
     enc_ids = {id(p) for p in enc_params}
