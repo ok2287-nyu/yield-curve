@@ -187,8 +187,6 @@ def scheduled_rollout(m, b, n, T, source):
         if len(srcs) != 1:
             raise ValueError("z_seq model: mixed prior/posterior schedules are undefined")
         src = srcs.pop()
-        if src == "pmean":
-            return m(imgs, act, spd, T, z_source="given", z_seq=[m.zero_z(B, imgs.device)])["green"][:, :, 0].float()
         return m(imgs, act, spd, T, z_source=src)["green"][:, :, 0].float()
     e = m.encode(imgs[:, :n + T])
     h, _ = m.warmup(e[:, :n], act, spd)

@@ -441,6 +441,28 @@ def test_z_seq_one_latent_per_sequence():
     torch.manual_seed(2); c = ms(b["images"], b["actions"], b["speed"], N_PRED, z_source="prior")["green"]
     assert torch.allclose(a, c, atol=1e-5)
 
+
+def test_z_seq_learned_prior():
+    """--z_seq --seq_prior: p(z | h_{n-1}) from the warm-up state; prior rollouts still ignore the future; the KL
+    and the anchor train the prior head; "pmean" uses the prior mean (no noise)."""
+    b = _batch(1)
+    m = _model(z_seq=16, seq_prior=True, anchor_prior=1e-3).eval()
+    imgs = b["images"].clone(); imgs[:, N_COND:] = 0.5
+    torch.manual_seed(1); p1 = m(b["images"], b["actions"], b["speed"], N_PRED, z_source="prior")["green"]
+    torch.manual_seed(1); p2 = m(imgs, b["actions"], b["speed"], N_PRED, z_source="prior")["green"]
+    assert torch.equal(p1, p2)
+    imgs = b["images"].clone(); imgs[:, 0] = 1 - imgs[:, 0]                     # the warm-up changes the prior
+    h1, _ = m.warmup(m.encode(b["images"][:, :N_COND]), b["actions"], b["speed"])
+    h2, _ = m.warmup(m.encode(imgs[:, :N_COND]), b["actions"], b["speed"])
+    assert not torch.allclose(m.prior_params(h1)[0], m.prior_params(h2)[0])
+    a = m(b["images"], b["actions"], b["speed"], N_PRED, z_source="pmean")["green"]
+    c = m(b["images"], b["actions"], b["speed"], N_PRED, z_source="pmean")["green"]
+    assert torch.equal(a, c)
+    m.train()
+    loss, logs = m.loss(b, N_PRED, beta=1e-3)
+    loss.backward()
+    assert m.prior.out.weight.grad.abs().sum() > 0 and logs["kl_anchor"] > 0
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

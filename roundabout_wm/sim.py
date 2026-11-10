@@ -135,9 +135,9 @@ class ImaginedDrive:
         if m.cfg.deterministic:
             z = m.zero_z(1, self.dev)
         elif m.cfg.z_seq:                           # sampled once per episode, then held
-            if self.z_episode is None:
-                mu = m.zero_z(1, self.dev)
-                self.z_episode = torch.randn(mu.shape, generator=self.gen, device=self.dev)
+            if self.z_episode is None:                # prior from the state after the warm-up (N(0, I) unless learned)
+                mu, lv = m.prior_params(self.h)
+                self.z_episode = mu + (0.5 * lv).exp() * torch.randn(mu.shape, generator=self.gen, device=self.dev)
             z = self.z_episode
         else:
             mu, lv = m.prior_params(self.h)

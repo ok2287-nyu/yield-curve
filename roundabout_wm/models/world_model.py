@@ -85,6 +85,8 @@ class WMConfig:
                                 # encoded real frames at 1/4, 2/4, 3/4 and 4/4 of the horizon). No per-step z and no
                                 # per-step z-dropout: training runs the same uncorrected 20-step rollout as imagination.
                                 # --p_openloop then means: this share of sequences uses a prior sample instead
+    seq_prior: bool = False     # z_seq only: a LEARNED prior p(z | h_{n-1}) (MLP head on the hidden state after the
+                                # warm-up) instead of N(0, I); combine with anchor_prior to pin z's scale
     logvar_min: float = -8.0
     logvar_max: float = 6.0
 
@@ -202,8 +204,9 @@ class WorldModel(nn.Module):
         self.P_z = ZExpander(G, C) if G else nn.Conv2d(Z, C, 1)                    # z -> Pred input
         self.A = nn.Sequential(nn.Linear(3, C), nn.LeakyReLU(0.2), nn.Linear(C, C * 64))  # (acc, curv, v) -> 256x8x8
         self.pred = ConvGRUCell(C, 3, p)                                           # Pred
-        if cfg.z_seq:                                                              # prior fixed N(0, I): no head
-            self.prior = nn.Identity()
+        if cfg.z_seq:                                                              # N(0, I) or p(z | h_{n-1})
+            self.prior = (GlobalGaussHead(C * 64, C, G, cfg.logvar_min, cfg.logvar_max) if cfg.seq_prior
+                          else nn.Identity())
             self.fut = nn.Conv2d(4 * C, C, 1)                                      # 4 future encodings -> C
             self.posterior = GlobalGaussHead(2 * C * 64, C, G, cfg.logvar_min, cfg.logvar_max)
         elif G:
@@ -254,7 +257,7 @@ class WorldModel(nn.Module):
 
     def prior_params(self, h):
         """(mu_p, logvar_p) of p(z | h): the learned prior head, or N(0, I) if cfg.fixed_prior."""
-        if self.cfg.fixed_prior or self.cfg.z_seq:
+        if self.cfg.fixed_prior or (self.cfg.z_seq and not self.cfg.seq_prior):
             z = self.zero_z(h.shape[0], h.device)
             return z, torch.zeros_like(z)
         return self.prior(h)
@@ -335,6 +338,8 @@ class WorldModel(nn.Module):
             if use_post:
                 mu_q, lv_q = self.seq_posterior(h, e, n_pred)
                 kls.append(gauss_kl(mu_q, lv_q, mu_p, lv_p))
+                if cfg.anchor_prior > 0:
+                    anchors.append(gauss_kl(mu_p, lv_p, torch.zeros_like(mu_p), torch.zeros_like(lv_p)))
                 with torch.no_grad():
                     lat.append(torch.stack([
                         lv_q.float().mean(), lv_p.float().mean(), (mu_q - mu_p).abs().float().mean(),
@@ -342,11 +347,13 @@ class WorldModel(nn.Module):
                         mu_q.float().std(0).mean() if B > 1 else mu_q.new_zeros((), dtype=torch.float32)]))
                 z_q = self._sample(mu_q, lv_q)
             if z_source == "mix":
-                z_fixed = torch.where(open_loop.view(B, 1), self._sample(mu_p, lv_p), z_q)
+                z_fixed = torch.where(open_loop.view(B, 1), self._sample(mu_p, lv_p, detach=cfg.prior_sg), z_q)
             elif z_source == "post":
                 z_fixed = z_q
             elif z_source == "prior":
                 z_fixed = self._sample(mu_p, lv_p)
+            elif z_source == "pmean":
+                z_fixed = mu_p
             elif z_source == "given":
                 z_fixed = z_seq[0]
             else:
@@ -367,7 +374,8 @@ class WorldModel(nn.Module):
             if z_fixed is not None:
                 h, g = self.rollout_step(h, z_fixed, actions[:, i], speeds[:, i], frame, prev)
                 greens.append(g); prev = g
-                stds.append(torch.ones(B, device=h.device)); std_maps.append(torch.ones(B, 8, 8, device=h.device))
+                sd = (0.5 * lv_p).exp().flatten(1).mean(1)
+                stds.append(sd); std_maps.append(sd[:, None, None].expand(B, 8, 8))
                 zs.append(z_fixed.detach())
                 continue
             mu_p, lv_p = self.prior_params(h)

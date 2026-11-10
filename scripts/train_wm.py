@@ -104,6 +104,8 @@ def args_():
     p.add_argument("--z_seq", type=int, default=0,
                    help="> 0: one latent of this many numbers per sequence (sampled once; fixed N(0, I) prior; "
                         "posterior reads the real frames at 1-4 s); no per-step z")
+    p.add_argument("--seq_prior", action="store_true",
+                   help="with --z_seq: learned prior p(z | h after the warm-up) instead of N(0, I) (use --anchor_prior)")
     p.add_argument("--fixed_prior", action="store_true",
                    help="p(z) = N(0, I) instead of the learned prior head (PPUU fwd-cnn-vae-fp)")
     p.add_argument("--best_of", type=int, default=1,
@@ -366,7 +368,8 @@ def main():
                       p_zdrop=a.p_zdrop, beta=a.beta, prior_sg=a.prior_sg, deterministic=a.deterministic,
                       p_openloop=a.p_openloop, residual=a.residual, reencode=a.reencode,
                       anchor_prior=a.anchor_prior, z_global=a.z_global, best_of=a.best_of,
-                      fixed_prior=a.fixed_prior, z_seq=a.z_seq)
+                      fixed_prior=a.fixed_prior, z_seq=a.z_seq,
+                      seq_prior=a.seq_prior)
     model = WorldModel(wm_cfg).to(dev)
     enc_params = list(model.encoder.parameters())
     enc_ids = {id(p) for p in enc_params}
