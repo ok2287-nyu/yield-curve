@@ -182,6 +182,14 @@ def scheduled_rollout(m, b, n, T, source):
     Same random-number use as forward() for all-"post" / all-"prior" schedules (tested). -> (B, T, 64, 64)."""
     imgs, act, spd = b["images"], b["actions"], b["speed"]
     B = imgs.shape[0]
+    if m.cfg.z_seq:                                 # one z per sequence: only constant schedules make sense
+        srcs = {source(k) for k in range(T)}
+        if len(srcs) != 1:
+            raise ValueError("z_seq model: mixed prior/posterior schedules are undefined")
+        src = srcs.pop()
+        if src == "pmean":
+            return m(imgs, act, spd, T, z_source="given", z_seq=[m.zero_z(B, imgs.device)])["green"][:, :, 0].float()
+        return m(imgs, act, spd, T, z_source=src)["green"][:, :, 0].float()
     e = m.encode(imgs[:, :n + T])
     h, _ = m.warmup(e[:, :n], act, spd)
     prev = imgs[:, n - 1, GREEN:GREEN + 1]
@@ -218,6 +226,11 @@ def rungs(m, b, n, T, k, mix_L=MIX_L):
     _, hs = m.warmup(e, act, spd)                                  # Pred reads every real frame 0 .. n+T-1
     out = {"truth": [real_g[:, n:n + T]]}
     out["recon"] = [torch.stack([m.decode(hs[j], real_g[:, j - 1:j]) for j in range(n, n + T)], 1)[:, :, 0]]
+    if m.cfg.z_seq:                                 # no per-step latent: no one-step or mixed-schedule rungs
+        out["roll_post"] = [scheduled_rollout(m, b, n, T, lambda s: "post")]
+        out["roll_prior"] = [scheduled_rollout(m, b, n, T, lambda s: "prior") for _ in range(k)]
+        out["roll_pmean"] = [scheduled_rollout(m, b, n, T, lambda s: "pmean")]
+        return out
     H = torch.stack(hs[n - 1:n + T - 1], 1).flatten(0, 1)          # h_{j-1} for every target j
     a1, s1 = act[:, n - 1:n + T - 1].flatten(0, 1), spd[:, n - 1:n + T - 1].flatten(0, 1)
     fr = imgs[:, n - 1:n + T - 1].flatten(0, 1) if m.cfg.reencode else None
