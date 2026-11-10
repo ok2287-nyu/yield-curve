@@ -104,6 +104,8 @@ def main():
         name = f"{os.path.basename(os.path.dirname(os.path.abspath(path)))}/{os.path.basename(path)}"
         if m.cfg.deterministic:
             print(f"\n{name}: deterministic, no latent; skipped"); continue
+        if m.cfg.z_seq:
+            print(f"\n{name}: one latent per sequence, no per-step prior/posterior; skipped"); continue
         ds = RounDWindows(a.cache, split, cfg, s["stats"], n_pred=T)
         idx = np.sort(np.random.default_rng(a.seed).choice(len(ds), min(a.n_windows, len(ds)), replace=False))
         # per track and step: sums, plus a random subsample of gaps for quantiles

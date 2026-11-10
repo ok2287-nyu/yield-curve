@@ -82,6 +82,7 @@ class ImaginedDrive:
         self.ego_blue = item["images"][n - 1, 2].clone()           # the ego is drawn identically in every frame
         self.t = 0                                                 # imagined steps taken
         self.gen = torch.Generator(device=self.dev).manual_seed(seed)
+        self.z_episode = None                                      # z_seq models: one z for the whole episode
         self.history = [item["images"][i] for i in range(n)]      # real warm-up frames, then imagined ones
         self.plan = []                                             # the actions you took
         # The human's route from the last real frame on, as curvature against distance travelled, so any speed
@@ -96,6 +97,7 @@ class ImaginedDrive:
 
     def reseed(self, seed: int):
         self.gen = torch.Generator(device=self.dev).manual_seed(seed)
+        self.z_episode = None                                      # z_seq models: one z for the whole episode
 
     @property
     def beyond_horizon(self) -> bool:
@@ -132,6 +134,11 @@ class ImaginedDrive:
         m = self.model
         if m.cfg.deterministic:
             z = m.zero_z(1, self.dev)
+        elif m.cfg.z_seq:                           # sampled once per episode, then held
+            if self.z_episode is None:
+                mu = m.zero_z(1, self.dev)
+                self.z_episode = torch.randn(mu.shape, generator=self.gen, device=self.dev)
+            z = self.z_episode
         else:
             mu, lv = m.prior_params(self.h)
             z = mu + (0.5 * lv).exp() * torch.randn(mu.shape, generator=self.gen, device=self.dev)
@@ -167,12 +174,12 @@ class ImaginedDrive:
     # ---- branching --------------------------------------------------------------------------------------------------
     def save(self, name: str):
         self._saved[name] = {"h": self.h.clone(), "state": self.state.copy(), "t": self.t, "s": self.s,
-                             "gen": self.gen.get_state(), "history": list(self.history), "plan": list(self.plan)}
+                             "gen": self.gen.get_state(), "z": self.z_episode, "history": list(self.history), "plan": list(self.plan)}
 
     def restore(self, name: str):
         s = self._saved[name]
         self.h, self.state, self.t = s["h"].clone(), s["state"].copy(), s["t"]
-        self.gen.set_state(s["gen"]); self.history = list(s["history"]); self.plan = list(s["plan"])
+        self.gen.set_state(s["gen"]); self.z_episode = s.get("z"); self.history = list(s["history"]); self.plan = list(s["plan"])
         self.s = s["s"]
 
 

@@ -409,6 +409,38 @@ def test_fixed_prior_is_standard_normal():
     h = torch.randn(B, 256, 8, 8)
     assert torch.equal(m0.prior_params(h)[0], m0.prior(h)[0])
 
+
+def test_z_seq_one_latent_per_sequence():
+    """--z_seq: one z for the whole rollout; the posterior reads only the real frames at 1/4..4/4 of the horizon;
+    prior rollouts never read future frames; KL is one value per sequence; scale-0 warm start = stage 1 exactly."""
+    b = _batch(0)
+    m = _model(z_seq=16).eval()
+    idx = m.seq_future_idx(N_PRED)
+    assert idx == [N_COND - 1 + j for j in (2, 3, 4, 6)]          # N_PRED = 6: round(1.5)=2, 3, round(4.5)=4, 6
+    torch.manual_seed(0); out = m(b["images"], b["actions"], b["speed"], N_PRED, z_source="post")
+    assert out["kl"].shape == (B, 1) and (out["kl"] >= 0).all()
+    assert all(torch.equal(out["z"][0], out["z"][k]) for k in range(N_PRED))   # the same z at every step
+    other = [j for j in range(N_COND, N_COND + N_PRED) if j not in idx]
+    for j, changes in ((other[0], False), (idx[1], True)):
+        imgs = b["images"].clone(); imgs[:, j] = 1 - imgs[:, j]
+        torch.manual_seed(0); o2 = m(imgs, b["actions"], b["speed"], N_PRED, z_source="post")
+        assert torch.equal(out["green"], o2["green"]) != changes, j
+    imgs = b["images"].clone(); imgs[:, N_COND:] = 0.5              # prior rollouts ignore the future entirely
+    torch.manual_seed(1); p1 = m(b["images"], b["actions"], b["speed"], N_PRED, z_source="prior")["green"]
+    torch.manual_seed(1); p2 = m(imgs, b["actions"], b["speed"], N_PRED, z_source="prior")["green"]
+    assert torch.equal(p1, p2)
+    m.train()
+    loss, logs = m.loss(b, N_PRED, beta=1e-3)
+    loss.backward()
+    assert m.fut.weight.grad.abs().sum() > 0 and m.posterior.out.weight.grad.abs().sum() > 0
+    assert abs(logs["prior_logvar"]) == 0
+    det = _model(deterministic=True).eval()
+    ms = _model(z_seq=16).eval()
+    ms.load_warm_start(det.state_dict(), pz_init_scale=0.0)
+    torch.manual_seed(2); a = det(b["images"], b["actions"], b["speed"], N_PRED)["green"]
+    torch.manual_seed(2); c = ms(b["images"], b["actions"], b["speed"], N_PRED, z_source="prior")["green"]
+    assert torch.allclose(a, c, atol=1e-5)
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

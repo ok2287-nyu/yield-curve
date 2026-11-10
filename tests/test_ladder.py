@@ -104,10 +104,13 @@ def test_rungs_shapes_and_deterministic_post_equals_prior():
     g = torch.Generator().manual_seed(0)
     b = {"images": (torch.rand(2, n + T, 3, 64, 64, generator=g) > 0.9).float(),
          "actions": torch.randn(2, n + T - 1, 2, generator=g), "speed": torch.randn(2, n + T, 1, generator=g)}
-    for kw in ({"deterministic": True}, {}, {"z_global": 8}, {"reencode": True}):
+    for kw in ({"deterministic": True}, {}, {"z_global": 8}, {"reencode": True}, {"z_seq": 8}):
         torch.manual_seed(0)
         m = WorldModel(WMConfig(n_cond=n, **kw)).eval()
         out = rungs(m, b, n, T, k=2)
+        if kw.get("z_seq"):
+            assert set(out) == {"truth", "recon", "roll_post", "roll_prior", "roll_pmean"}
+            continue
         assert set(out) == set(RUNGS) and len(out["roll_prior"]) == 2 and len(out["mix_L1"]) == 2
         for r, preds in out.items():
             for p in preds:

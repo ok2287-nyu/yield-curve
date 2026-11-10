@@ -80,6 +80,11 @@ class WMConfig:
                                 # the cars it drew; needs the window's road/ego frames up to n_cond + n_pred - 1
     fixed_prior: bool = False   # PPUU's fwd-cnn-vae-fp: p(z) = N(0, I) whatever h is (the prior head is unused).
                                 # Tests whether the learned, h-dependent prior is what loses cars in prior rollouts
+    z_seq: int = 0              # > 0: ONE latent of this many numbers per sequence (sampled once, fed at every rollout
+                                # step through a Linear expander), prior fixed N(0, I), posterior q(z | h_{n-1}, the
+                                # encoded real frames at 1/4, 2/4, 3/4 and 4/4 of the horizon). No per-step z and no
+                                # per-step z-dropout: training runs the same uncorrected 20-step rollout as imagination.
+                                # --p_openloop then means: this share of sequences uses a prior sample instead
     logvar_min: float = -8.0
     logvar_max: float = 6.0
 
@@ -193,11 +198,15 @@ class WorldModel(nn.Module):
         C, Z, p = cfg.hidden, cfg.z_ch, cfg.dropout
         self.encoder = build_encoder(cfg.encoder, C)                               # Enc: the only part that differs
         self.P_e = nn.Conv2d(C, C, 1)                                              # encoder -> Pred input (warm-up)
-        G = cfg.z_global
+        G = cfg.z_global or cfg.z_seq
         self.P_z = ZExpander(G, C) if G else nn.Conv2d(Z, C, 1)                    # z -> Pred input
         self.A = nn.Sequential(nn.Linear(3, C), nn.LeakyReLU(0.2), nn.Linear(C, C * 64))  # (acc, curv, v) -> 256x8x8
         self.pred = ConvGRUCell(C, 3, p)                                           # Pred
-        if G:
+        if cfg.z_seq:                                                              # prior fixed N(0, I): no head
+            self.prior = nn.Identity()
+            self.fut = nn.Conv2d(4 * C, C, 1)                                      # 4 future encodings -> C
+            self.posterior = GlobalGaussHead(2 * C * 64, C, G, cfg.logvar_min, cfg.logvar_max)
+        elif G:
             self.prior = GlobalGaussHead(C * 64, C, G, cfg.logvar_min, cfg.logvar_max)
             self.posterior = GlobalGaussHead(2 * C * 64, C, G, cfg.logvar_min, cfg.logvar_max)
         else:
@@ -221,7 +230,7 @@ class WorldModel(nn.Module):
 
     def zero_z(self, B, device):
         """z = 0 in this model's latent shape: (B, z_global) or (B, z_ch, 8, 8)."""
-        G = self.cfg.z_global
+        G = self.cfg.z_global or self.cfg.z_seq
         return torch.zeros(B, G, device=device) if G else torch.zeros(B, self.cfg.z_ch, 8, 8, device=device)
 
     def decode(self, h, prev=None):
@@ -245,10 +254,20 @@ class WorldModel(nn.Module):
 
     def prior_params(self, h):
         """(mu_p, logvar_p) of p(z | h): the learned prior head, or N(0, I) if cfg.fixed_prior."""
-        if self.cfg.fixed_prior:
+        if self.cfg.fixed_prior or self.cfg.z_seq:
             z = self.zero_z(h.shape[0], h.device)
             return z, torch.zeros_like(z)
         return self.prior(h)
+
+    def seq_future_idx(self, n_pred):
+        """Indices (into the window) of the real frames the sequence posterior reads: 1/4 .. 4/4 of the horizon."""
+        n = self.cfg.n_cond
+        return [n - 1 + max(1, round(n_pred * j / 4)) for j in range(1, 5)]
+
+    def seq_posterior(self, h, e, n_pred):
+        """q(z | h_{n-1}, future) for z_seq models. h (B, C, 8, 8) after the warm-up; e (B, >= n+n_pred, C, 8, 8)."""
+        fut = self.fut(torch.cat([e[:, i] for i in self.seq_future_idx(n_pred)], 1))
+        return self.posterior(torch.cat([h, fut], 1))
 
     def _sample(self, mu, lv, detach=False):
         if detach:
@@ -310,6 +329,28 @@ class WorldModel(nn.Module):
         B = h.shape[0]
         if z_source == "mix" and open_loop is None:  # which sequences are fully open loop (drawn once per sequence)
             open_loop = torch.rand(B, device=h.device) < cfg.p_openloop
+        z_fixed = None                              # z_seq: one z for the whole rollout
+        if cfg.z_seq and z_source != "zero":
+            mu_p, lv_p = self.prior_params(h)
+            if use_post:
+                mu_q, lv_q = self.seq_posterior(h, e, n_pred)
+                kls.append(gauss_kl(mu_q, lv_q, mu_p, lv_p))
+                with torch.no_grad():
+                    lat.append(torch.stack([
+                        lv_q.float().mean(), lv_p.float().mean(), (mu_q - mu_p).abs().float().mean(),
+                        mu_q.float().abs().mean(), mu_p.float().abs().mean(),
+                        mu_q.float().std(0).mean() if B > 1 else mu_q.new_zeros((), dtype=torch.float32)]))
+                z_q = self._sample(mu_q, lv_q)
+            if z_source == "mix":
+                z_fixed = torch.where(open_loop.view(B, 1), self._sample(mu_p, lv_p), z_q)
+            elif z_source == "post":
+                z_fixed = z_q
+            elif z_source == "prior":
+                z_fixed = self._sample(mu_p, lv_p)
+            elif z_source == "given":
+                z_fixed = z_seq[0]
+            else:
+                raise ValueError(z_source)
         for k in range(n_pred):
             i = n - 1 + k                                                          # current frame; predict i+1
             frame = None
@@ -322,6 +363,12 @@ class WorldModel(nn.Module):
                 greens.append(g); prev = g
                 stds.append(torch.zeros(B, device=h.device)); std_maps.append(torch.zeros(B, 8, 8, device=h.device))
                 zs.append(z)
+                continue
+            if z_fixed is not None:
+                h, g = self.rollout_step(h, z_fixed, actions[:, i], speeds[:, i], frame, prev)
+                greens.append(g); prev = g
+                stds.append(torch.ones(B, device=h.device)); std_maps.append(torch.ones(B, 8, 8, device=h.device))
+                zs.append(z_fixed.detach())
                 continue
             mu_p, lv_p = self.prior_params(h)
             if use_post:
@@ -399,7 +446,7 @@ class WorldModel(nn.Module):
                       "kl": kl.item(), "kl_anchor": anchor.item(), "prior_std": out["prior_std"].mean().item()} | lat
 
     # ---- stage 2 initialisation ----------------------------------------------------------------------------------
-    FRESH = ("prior.", "posterior.", "P_z.")
+    FRESH = ("prior.", "posterior.", "P_z.", "fut.")
 
     def load_warm_start(self, state_dict, pz_init_scale: float = 0.0):
         """Copy a (deterministic) stage-1 model into this one, except the prior, posterior and P_z, which start
@@ -417,8 +464,9 @@ class WorldModel(nn.Module):
         self.load_state_dict(keep, strict=False)
         with torch.no_grad():
             C = self.cfg.hidden
-            if self.cfg.z_global:                   # stage 1 had the spatial P_z; P_z(0) = its bias at every cell
-                fresh = nn.Linear(self.cfg.z_global, C * 64).to(self.P_z.lin.weight.device)
+            G = self.cfg.z_global or self.cfg.z_seq
+            if G:                                   # stage 1 had the spatial P_z; P_z(0) = its bias at every cell
+                fresh = nn.Linear(G, C * 64).to(self.P_z.lin.weight.device)
                 self.P_z.lin.weight.copy_(fresh.weight * pz_init_scale)
                 b = state_dict.get("P_z.bias", state_dict.get("P_z.lin.bias"))
                 self.P_z.lin.bias.copy_(b.view(C, 1, 1).expand(C, 8, 8).reshape(-1) if b.numel() == C else b)
