@@ -96,3 +96,21 @@ def test_cost_terms():
     c = plan_costs(g, np.array([[8.0, 8.0, 8.0, 8.0]]), np.zeros((1, 3)), np.zeros((1, 3)), rc, cc)
     assert c["epistemic"].item() == 0 and abs(c["progress"].item() - 3 * (1 - 0.8) ** 2) < 1e-5
     assert c["total"].item() > c["risk"].item() > 0
+
+
+def test_predicted_gap_and_headway():
+    from roundabout_wm.controller.cost import headway_violation, predicted_gap
+    rc, cc = CFG.render, CostConfig()
+    g = torch.zeros(3, 64, 64)
+    g[0, 20:26, 29:34] = 1.0             # a car ahead in the lane: rows 20..25 -> nearest row 25
+    g[1, 20:26, 5:10] = 1.0              # a car ahead in another lane: not in the corridor
+    g[2, 40:46, 29:34] = 1.0             # a car on the ego
+    gap = predicted_gap(g, rc, cc)
+    assert abs(gap[0] - ((43 - 25) * 0.75 - 2.25)) < 1e-5 and gap[1] == float("inf") and gap[2] == 0
+    # a lead at 10 m that the model lets vanish while the ego drives at 8 m/s
+    seq = torch.tensor([[10.0, 9.0, float("inf"), float("inf")]])
+    v = torch.full((1, 4), 8.0)
+    bad, _ = headway_violation(seq, v, d0=1.0, tau=1.0)
+    assert not bad[0]                    # 10, 9 >= 1 + 8, then the lead vanishes: not seen
+    bad, capped = headway_violation(seq, v, d0=1.0, tau=1.0, lead_vmax=6.0)
+    assert bad[0] and abs(capped[0, -1] - 8.2) < 1e-5     # the lead can pull away at 6 m/s at most: 9 - 2 * 0.4
