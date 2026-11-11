@@ -16,7 +16,7 @@
 | Kinematics | midpoint rule (see kinematics.py) | Extraction and integration are exact inverses |
 | Ego motion | kinematic update, not predicted by the world model | Ego must obey the action; the model only learns how others respond |
 | State for the model | image + normalised ego speed; no world heading, no 2-D velocity | Velocity always points up in the ego frame; heading would label the roundabout arm |
-| Loss | per-pixel-mean MSE on the green channel (rollout + warm-up, equal weight) + beta * KL, beta = 1e-6, KL summed over the 8x8x8 latent | PPUU's convention; z-dropout, not beta, regularises z. Revisit BCE / per-cell CE if cars fade |
+| Loss | per-pixel-mean MSE on the green channel (rollout + warm-up, equal weight) + beta * KL, beta = 1e-4 (stage 2), KL summed over the 8x8x8 latent | beta 1e-6 was the original plan; 1e-4 is what the stage-2 ablations used (1e-5: more fading; 1e-3: z unused) |
 | World model | spatial RSSM: per-frame encoder -> ConvGRU h (256x8x8) -> decoder; learned prior p(z\|h) and posterior q(z\|h, e_next), z = 8x8x8 per-cell Gaussian; z-dropout p = 0.5 | Memory across steps, no re-encoding of predictions, per-cell aleatoric signal (context doc section 3) |
 | Action path | (acc, curv, speed) only into Pred through A; never into the prior or posterior | Matches PPUU and PlaNet; the prior reacts to the ego one step (0.2 s) later |
 | Stop-gradient on prior samples | on (`--prior_sg`, default); `--no-prior_sg` for the ablation. KL balancing not used | Without it the MSE on z-dropout prior steps drives sigma_p to 0; with it the prior head learns only from the KL (adopted Oct 23) |
@@ -26,6 +26,8 @@
 | Prediction target | green channel only; red/blue at t+1 come from the ego pose | Model learns only how others move |
 | Output | plain sigmoid, no residual on a previous frame | Latent stepping has no previous frame to add |
 | Training rollout | 20 steps (4 s), autoregressive in h only; gradients through all 30 steps | Trains on its own state (drift); PPUU's forward model used 20 |
+| Stage-2 prior (Nov 11) | fixed N(0, I) (`--fixed_prior`); learned prior + `--anchor_prior 1e-6` kept as the ablation | With a learned prior and linear P_z, z's scale is free and all log-variances drift to the clamp. Fixed and anchored learned priors behave almost the same; the fixed prior is a bit sharper at 2 s (0.85 vs 0.79) and simpler. docs/stage2_findings.md |
+| Horizon for planning and evaluation (Nov 11) | 1 s and 2 s; models still trained on 4 s; 4 s reported as a limitation | Seen road users are kept to 2 s and fade between 2 and 4 s in every variant tried (docs/stage2_findings.md). 2 s is also PPUU's horizon |
 | Encoder comparison | CNN vs ViT vs ViT+MAE on single frames (3x64x64 -> 256x8x8); everything else fixed | One factor at a time (docs/experiments.md) |
 | Split | Neuweiler (locationId 0) only, by whole recording: last 3 ids test, 3 before val, rest train | No leakage between splits |
 | Normalisation | speed and action mean/std from train recordings only | Standard |
@@ -36,4 +38,6 @@
 - At 0.75 m/px a pedestrian is about 1 px of mass (a car ~17 px), so VRUs carry little weight in the MSE; each VRU class is inside the crop in at most ~2.5% of ego frames (Oct 23 estimate).
 - Other cars come from the log and never react to the ego (log replay), as in PPUU.
 - The crop sees 24 m to each side; a fast car (up to ~14 m/s) can enter the crop from outside during the 4 s horizon.
+- Imagination (prior rollouts) loses about 30% of seen road users' area by 4 s (kept 0.71, closed-window mass 0.80); the fixes tried trade fading for blur or invented traffic (docs/stage2_findings.md).
+- Small road users (bicycles, motorcycles) are lost even by posterior rollouts.
 - In open-loop reconstruction, heading changes while nearly stopped (< 0.5 m/s) are lost; error stays under 1 m for 95% of 3 s windows.

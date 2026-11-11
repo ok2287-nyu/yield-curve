@@ -80,28 +80,36 @@ this is the fair kinematic baseline for a model that predicts a blurry mean. Rep
 
 ---
 
-## 2. Stage 2: the stochastic model (50,000 steps, warm-started from stage 1)
+## 2. Stage 2: the stochastic model (20,000 steps, warm-started from stage 1) — frozen Nov 11
 
-Adds the latent z (learned prior + posterior) on top of the stage-1 model, so samples can show *different* futures.
-The recipe below came out of the Nov 4 ablation (it is the only one that used z without collapsing):
+Adds the latent z on top of the stage-1 model, so samples can show *different* futures. **Frozen recipe (Nov 11,
+the same for every encoder):** fixed N(0, I) prior, everything else as before.
 
 - `--init_from <stage 1>/best.pt` start from the deterministic model
 - `--pz_init_scale 0.01` z's input layer starts small but not zero (zero blocks all learning of z)
 - `--kl_warmup_steps 2000` no KL penalty for 2k steps, then a ramp to beta (prevents posterior collapse)
 - `--beta 1e-4`
+- `--fixed_prior` p(z) = N(0, I). With the learned prior, z's scale is free (learned prior + linear P_z) and
+  **every log-variance drifts to the clamp (6)**; the old recipe without this flag should not be used. The learned
+  prior with `--anchor_prior 1e-6` is the kept ablation (`ab_anchor`); it behaves almost the same (see
+  `docs/stage2_findings.md`).
 
 ```bash
-STAGE2="--pz_init_scale 0.01 --kl_warmup_steps 2000 --beta 1e-4"
+STAGE2="--pz_init_scale 0.01 --kl_warmup_steps 2000 --beta 1e-4 --fixed_prior"
 # cnn
-sbatch --export=ALL,ENCODER=cnn,RUN=cnn_sto,STEPS=50000,WANDB=1,EXTRA_ARGS="--init_from runs/cnn_det/best.pt $STAGE2" scripts/hpc/train_wm.sbatch
+sbatch --export=ALL,ENCODER=cnn,RUN=cnn_sto,STEPS=20000,WANDB=1,EXTRA_ARGS="--init_from runs/cnn_det/best.pt $STAGE2" scripts/hpc/train_wm.sbatch
 # vit
-sbatch --export=ALL,ENCODER=vit,RUN=vit_sto,STEPS=50000,WANDB=1,EXTRA_ARGS="--init_from runs/vit_det/best.pt $STAGE2" scripts/hpc/train_wm.sbatch
+sbatch --export=ALL,ENCODER=vit,RUN=vit_sto,STEPS=20000,WANDB=1,EXTRA_ARGS="--init_from runs/vit_det/best.pt $STAGE2" scripts/hpc/train_wm.sbatch
 # vit_mae (keep the encoder's learning rate at 0.1x, as in stage 1)
-sbatch --export=ALL,ENCODER=vit,RUN=vit_mae_sto,STEPS=50000,WANDB=1,EXTRA_ARGS="--init_from runs/vit_mae_det/best.pt --enc_lr_mult 0.1 $STAGE2" scripts/hpc/train_wm.sbatch
+sbatch --export=ALL,ENCODER=vit,RUN=vit_mae_sto,STEPS=20000,WANDB=1,EXTRA_ARGS="--init_from runs/vit_mae_det/best.pt --enc_lr_mult 0.1 $STAGE2" scripts/hpc/train_wm.sbatch
 ```
 
-Train long: 50k steps, the same as stage 1 (about 2.8 h for the CNN). PPUU trained its stochastic model for at least
-as long as its deterministic one; 10k-step stage-2 runs were not long enough to judge.
+20k steps take about 1 h for the CNN on one A100. Longer training did not help (ws_both_long, 50k steps: no trend
+from 16k on). For the CNN, the existing run `ab_fixedprior` already is this recipe (no need to retrain).
+
+**Horizon.** Models are trained on 4 s, but imagination is reliable only to about 2 s: seen road users are kept at
+2 s (kept 0.91, lead road user 0.97 for the CNN) and fade between 2 and 4 s (kept 0.71 at 4 s) in every variant
+we tried. Planning and the encoder comparison use **1 s and 2 s**; 4 s is reported as a measured limitation.
 
 **Which checkpoint.** Since the `eval-tools` merge, a stochastic run saves as `best.pt` the checkpoint with the
 lowest **validation ELBO** (posterior MSE + warm-up MSE + beta x KL, with the run's final beta; logged as `elbo`), not
@@ -125,11 +133,22 @@ EOF
 | Check | Pass | Fail looks like |
 |---|---|---|
 | `kl` | clearly above 0 (several nats) and not falling towards 0 | ~0.01: z collapsed, the model is deterministic again |
+| `prior_std` | exactly 1.000 (fixed prior) | anything else: `--fixed_prior` was not passed |
 | `spread@20` | clearly above 0 | ~0.000x: all samples identical |
 | `post@k` < `prior@k` | yes (the posterior saw the future) | equal: z is unused |
 | `mass@20` | rising towards 1 over training | stuck well below 1: samples fade |
 | `act_sens` | clearly above 0 | ~0: the model ignores the ego |
 | `elbo` | falling, then flat | rising while `kl` rises: beta too small, z is memorising |
+
+**Evaluation for the encoder comparison** (CPU, Jupyter session; same windows for every encoder):
+
+```bash
+C="--cache ../round_cache"; D="--data_dir ../round_data"
+python scripts/ladder.py $C $D --ckpts runs/<run>/last.pt --n_windows 500       # kept / lost / sharp / invented / lead, 1 s and 2 s
+python scripts/closed_mass.py $C $D --ckpts runs/<run>/last.pt --k 4            # position-free mass + sample spread
+python scripts/eval_sharpness.py $C --ckpts runs/<run>/last.pt                  # mass / sharpness / MSE at 1, 2, 4 s
+python scripts/leakage.py --ckpt runs/<run>/last.pt $C $D --n_scenes 300 --pairs log:coast,log:brake   # leakage share at 2 s
+```
 
 A single prior sample is **expected** to have a higher MSE than the stage-1 model. That is not a failure: each sample
 commits to one future, the mean hedges. Do not judge stage 2 by beating stage 1 on MSE.
