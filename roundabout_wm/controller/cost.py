@@ -101,3 +101,32 @@ def plan_costs(green, speed, acc, curv, rc, cc: CostConfig, acc_prev: float = 0.
     total = risk + cc.w_epi * torch.clamp(epi - cc.epi_thresh, min=0) + cc.w_prog * prog + comfort
     return {"total": total, "risk": risk, "epistemic": epi, "progress": prog, "comfort": comfort,
             "collision": col, "proximity": prox}
+
+
+# ---- headway check (a safety layer that does not need the model to draw a collision) ----------------------------
+def predicted_gap(green, rc, cc: CostConfig, thresh: float = 0.25, corridor: float = 0.5):
+    """green (..., 64, 64) -> (...,) metres from the ego's front to the nearest pixel with green > thresh in its lane
+    corridor (|lateral| < ego half width + corridor), from the ego's rear forward; inf if none. A car on the ego
+    gives 0."""
+    idx = torch.arange(rc.size, dtype=torch.float32, device=green.device)
+    fwd = (rc.ego_row - idx)[:, None].expand(rc.size, rc.size) * rc.m_per_px
+    lat = (rc.ego_col - idx)[None, :].expand(rc.size, rc.size).abs() * rc.m_per_px
+    zone = (lat < cc.ego_width / 2 + corridor) & (fwd > -cc.ego_length / 2)
+    dist = torch.clamp(fwd - cc.ego_length / 2, min=0)
+    d = torch.where((green > thresh) & zone, dist, torch.full_like(dist, float("inf")))
+    return d.flatten(-2).amin(-1)
+
+
+def headway_violation(gap, speed_after, d0=2.0, tau=1.0, lead_vmax=None, dt=0.2):
+    """gap (..., T) predicted gaps (predicted_gap per step); speed_after (..., T) ego speed at those steps.
+    Violation if at any step gap < d0 + tau * v. lead_vmax (m/s): if set, a lead seen at one step cannot pull away
+    faster than lead_vmax: gap_t is capped at gap_{t-1} + (lead_vmax - v_t) * dt, so a car the model lets fade or
+    vanish while the ego closes in still counts. -> (...,) bool, and the (capped) gaps."""
+    gap = torch.as_tensor(gap, dtype=torch.float32)
+    v = torch.as_tensor(speed_after, dtype=torch.float32, device=gap.device).expand_as(gap)
+    if lead_vmax is not None:
+        g = [gap[..., 0]]
+        for t in range(1, gap.shape[-1]):
+            g.append(torch.minimum(gap[..., t], g[-1] + (lead_vmax - v[..., t]) * dt))
+        gap = torch.stack(g, -1)
+    return (gap < d0 + tau * v).any(-1), gap
