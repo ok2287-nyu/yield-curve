@@ -83,19 +83,20 @@ this is the fair kinematic baseline for a model that predicts a blurry mean. Rep
 ## 2. Stage 2: the stochastic model (20,000 steps, warm-started from stage 1) — frozen Nov 11
 
 Adds the latent z on top of the stage-1 model, so samples can show *different* futures. **Frozen recipe (Nov 11,
-the same for every encoder):** fixed N(0, I) prior, everything else as before.
+the same for every encoder):** learned prior pinned by a weak anchor, everything else as before.
 
 - `--init_from <stage 1>/best.pt` start from the deterministic model
 - `--pz_init_scale 0.01` z's input layer starts small but not zero (zero blocks all learning of z)
 - `--kl_warmup_steps 2000` no KL penalty for 2k steps, then a ramp to beta (prevents posterior collapse)
 - `--beta 1e-4`
-- `--fixed_prior` p(z) = N(0, I). With the learned prior, z's scale is free (learned prior + linear P_z) and
-  **every log-variance drifts to the clamp (6)**; the old recipe without this flag should not be used. The learned
-  prior with `--anchor_prior 1e-6` is the kept ablation (`ab_anchor`); it behaves almost the same (see
-  `docs/stage2_findings.md`).
+- `--anchor_prior 1e-6` adds 1e-6 x KL(prior || N(0, I)). Without it, z's scale is free (learned prior + linear
+  P_z) and **every log-variance drifts to the clamp (6)**: the old recipe without this flag must not be used.
+  Why the learned prior: its per-cell sigma_p is a validated uncertainty map (it predicts which road users' futures
+  the model gets wrong; `docs/stage2_findings.md`). The fixed prior (`--fixed_prior`, run `ab_fixedprior`) is the
+  kept ablation: slightly sharper at 2 s, no uncertainty map.
 
 ```bash
-STAGE2="--pz_init_scale 0.01 --kl_warmup_steps 2000 --beta 1e-4 --fixed_prior"
+STAGE2="--pz_init_scale 0.01 --kl_warmup_steps 2000 --beta 1e-4 --anchor_prior 1e-6"
 # cnn
 sbatch --export=ALL,ENCODER=cnn,RUN=cnn_sto,STEPS=20000,WANDB=1,EXTRA_ARGS="--init_from runs/cnn_det/best.pt $STAGE2" scripts/hpc/train_wm.sbatch
 # vit
@@ -105,10 +106,10 @@ sbatch --export=ALL,ENCODER=vit,RUN=vit_mae_sto,STEPS=20000,WANDB=1,EXTRA_ARGS="
 ```
 
 20k steps take about 1 h for the CNN on one A100. Longer training did not help (ws_both_long, 50k steps: no trend
-from 16k on). For the CNN, the existing run `ab_fixedprior` already is this recipe (no need to retrain).
+from 16k on). For the CNN, the existing run `ab_anchor` already is this recipe (no need to retrain).
 
 **Horizon.** Models are trained on 4 s, but imagination is reliable only to about 2 s: seen road users are kept at
-2 s (kept 0.91, lead road user 0.97 for the CNN) and fade between 2 and 4 s (kept 0.71 at 4 s) in every variant
+2 s (kept 0.90, lead road user 0.96 for the CNN) and fade between 2 and 4 s (kept 0.69 at 4 s) in every variant
 we tried. Planning and the encoder comparison use **1 s and 2 s**; 4 s is reported as a measured limitation.
 
 **Which checkpoint.** Since the `eval-tools` merge, a stochastic run saves as `best.pt` the checkpoint with the
@@ -133,7 +134,7 @@ EOF
 | Check | Pass | Fail looks like |
 |---|---|---|
 | `kl` | clearly above 0 (several nats) and not falling towards 0 | ~0.01: z collapsed, the model is deterministic again |
-| `prior_std` | exactly 1.000 (fixed prior) | anything else: `--fixed_prior` was not passed |
+| `prior_std` | about 1–3, stable (anchored learned prior; 1.000 exactly for the fixed-prior ablation) | ~20: the variances hit the clamp, `--anchor_prior` was not passed |
 | `spread@20` | clearly above 0 | ~0.000x: all samples identical |
 | `post@k` < `prior@k` | yes (the posterior saw the future) | equal: z is unused |
 | `mass@20` | rising towards 1 over training | stuck well below 1: samples fade |
@@ -147,6 +148,7 @@ C="--cache ../round_cache"; D="--data_dir ../round_data"
 python scripts/ladder.py $C $D --ckpts runs/<run>/last.pt --n_windows 500       # kept / lost / sharp / invented / lead, 1 s and 2 s
 python scripts/closed_mass.py $C $D --ckpts runs/<run>/last.pt --k 4            # position-free mass + sample spread
 python scripts/eval_sharpness.py $C --ckpts runs/<run>/last.pt                  # mass / sharpness / MSE at 1, 2, 4 s
+python scripts/uncertainty_map.py $C $D --ckpts runs/<run>/last.pt --k 8        # sigma_p vs spread / error, world map
 python scripts/leakage.py --ckpt runs/<run>/last.pt $C $D --n_scenes 300 --pairs log:coast,log:brake   # leakage share at 2 s
 ```
 

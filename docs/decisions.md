@@ -26,7 +26,7 @@
 | Prediction target | green channel only; red/blue at t+1 come from the ego pose | Model learns only how others move |
 | Output | plain sigmoid, no residual on a previous frame | Latent stepping has no previous frame to add |
 | Training rollout | 20 steps (4 s), autoregressive in h only; gradients through all 30 steps | Trains on its own state (drift); PPUU's forward model used 20 |
-| Stage-2 prior (Nov 11) | fixed N(0, I) (`--fixed_prior`); learned prior + `--anchor_prior 1e-6` kept as the ablation | With a learned prior and linear P_z, z's scale is free and all log-variances drift to the clamp. Fixed and anchored learned priors behave almost the same; the fixed prior is a bit sharper at 2 s (0.85 vs 0.79) and simpler. docs/stage2_findings.md |
+| Stage-2 prior (Nov 11) | learned prior p(z\|h) + `--anchor_prior 1e-6`; fixed N(0, I) (`--fixed_prior`) kept as the ablation | Without the anchor, z's scale is free and all log-variances drift to the clamp. The anchored learned prior's sigma_p is a validated uncertainty map (within road-user cells, Spearman 0.67 with the error and 0.69 with sample spread); it costs a little sharpness at 2 s (0.79 vs 0.85). docs/stage2_findings.md |
 | Horizon for planning and evaluation (Nov 11) | 1 s and 2 s; models still trained on 4 s; 4 s reported as a limitation | Seen road users are kept to 2 s and fade between 2 and 4 s in every variant tried (docs/stage2_findings.md). 2 s is also PPUU's horizon |
 | Encoder comparison | CNN vs ViT vs ViT+MAE on single frames (3x64x64 -> 256x8x8); everything else fixed | One factor at a time (docs/experiments.md) |
 | Split | Neuweiler (locationId 0) only, by whole recording: last 3 ids test, 3 before val, rest train | No leakage between splits |
