@@ -20,6 +20,8 @@ Prints, per checkpoint:
     - means of each map in cells with and without a road user
     - Spearman correlations between the maps (over all cell-steps). A meaningful uncertainty map should rise where
       samples spread and where the model is wrong.
+    - the same correlations within road-user cells only: every map is larger where a road user is, so this is the
+      test of whether a map says WHICH road users are uncertain, not just where road users are.
 Writes, next to the first checkpoint unless --out_dir:
     uncertainty_<run>.png   the maps averaged in WORLD coordinates (3 m bins) over the roundabout photo
     uncertainty_<run>.npz   the world grids (sum, count) for each map
@@ -197,6 +199,19 @@ def main():
             for y in use:
                 if x < y:
                     row[f"rho_{x}_{y}"] = corr.loc[x, y]
+        # all maps are much larger where a road user is, so the correlations above are partly "is there a road
+        # user here". Within road-user cells only: does the map still say WHICH road users are uncertain?
+        occ_df = df[df.occ]
+        sub = occ_df.sample(min(len(occ_df), a.max_corr), random_state=a.seed)
+        use_o = [k for k in use if sub[k].std() > 1e-9]
+        if len(sub) > 100 and len(use_o) > 1:
+            corr_o = sub[use_o].corr(method="spearman")
+            print(f"  Spearman correlations within road-user cells only ({len(occ_df)} cell-steps):")
+            print("  " + corr_o.round(2).to_string().replace("\n", "\n  "))
+            for x in use_o:
+                for y in use_o:
+                    if x < y:
+                        row[f"rho_occ_{x}_{y}"] = corr_o.loc[x, y]
         stats.append(row)
         np.savez(os.path.join(out_dir, f"uncertainty_{run}.npz"), count=cnt, bin=a.bin, bg_m_per_px=bg_m,
                  **{k: grid[k] for k in MAPS})
