@@ -93,6 +93,12 @@ def test_open_loop_plans():
     assert out["green"].shape == (2, T, 64, 64)
     assert not out["front"][0].any() and out["front"][1].any()
     assert np.allclose(out["gap"][0], 15.5)
+    assert next(h for h in out["hit_ids"][1] if h) == [(2, "front")]  # it first drives into the leader
+    # without followers: the follower (12 m behind) is gone, the leader stays
+    assert out["green"][0, 0, 50:].sum() > 0 and out["green_nf"][0, 0, 50:].sum() == 0
+    assert np.array_equal(out["green"][0, 0, :40], out["green_nf"][0, 0, :40])
+    fp = env.footprint(2, out["poses"][0, 1], 1)                    # the leader alone, 20 m ahead = 26.7 px up
+    assert abs(fp.sum() - (4.5 / 0.75) * (1.8 / 0.75)) < 2.0 and fp[43 - 27].sum() > 0
 
 
 if __name__ == "__main__":
