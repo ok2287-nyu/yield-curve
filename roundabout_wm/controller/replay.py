@@ -302,8 +302,11 @@ class ReplayEnv:
 
     def open_loop(self, speeds):
         """Open-loop plans from the episode start (call right after reset). speeds (P, T + 1) m/s along the path.
-        -> green uint8 (P, T, 64, 64) real frames at the plans' poses with the logged road users, front, side, rear
-        (P, T) bool collisions, gap (P, T) metres. Steps past the end of the recording are dropped (T shrinks)."""
+        -> green uint8 (P, T, 64, 64) real frames at the plans' poses with the logged road users;
+           green_nf the same without followers (road users whose centre is more than a quarter of the ego's length
+           behind the ego's centre: a plan that slows down is not charged for the logged follower driving into it);
+           front, side, rear (P, T) bool collisions; hit_ids[p][t] list of (trackId, class); gap (P, T) metres.
+        Steps past the end of the recording are dropped (T shrinks)."""
         dt, step = self.cfg.data.dt, self.cfg.data.step
         speeds = np.asarray(speeds, dtype=np.float64)
         P, T = speeds.shape[0], min(speeds.shape[1] - 1, (self.R.last_frame - self.f0) // step)
@@ -311,17 +314,32 @@ class ReplayEnv:
         poses = self.path.poses(s)                                                   # (P, T + 1, 3)
         rs = self.cfg.render.size
         green = np.zeros((P, T, rs, rs), np.uint8)
+        green_nf = np.zeros((P, T, rs, rs), np.uint8)
         hits = {c: np.zeros((P, T), bool) for c in ("front", "side", "rear")}
+        hit_ids = [[[] for _ in range(T)] for _ in range(P)]
         gap = np.full((P, T), np.inf)
         for t in range(T):
             others = self.R.others(self.frame_at(t + 1), self.ego_id)
             for p in range(P):
                 ego = self.ego_dict(tuple(poses[p, t + 1]))
                 green[p, t] = render_frame(ego, others, None, self.cfg.render)[1]
-                for _, c in collisions(ego, others):
+                fwd = to_ego(np.stack([others["x"], others["y"]], -1), ego["x"], ego["y"], ego["heading"])[..., 0] \
+                    if len(others["x"]) else np.zeros(0)
+                keep = fwd >= -ego["length"] / 4
+                green_nf[p, t] = render_frame(ego, {k: v[keep] for k, v in others.items()}, None,
+                                              self.cfg.render)[1]
+                for tid, c in collisions(ego, others):
                     hits[c][p, t] = True
+                    hit_ids[p][t].append((tid, c))
                 gap[p, t] = front_gap(ego, others)
-        return {"green": green, "poses": poses, "gap": gap, **hits}
+        return {"green": green, "green_nf": green_nf, "poses": poses, "gap": gap, "hit_ids": hit_ids, **hits}
+
+    def footprint(self, track_id, pose, t):
+        """(64, 64) float in [0, 1]: road user `track_id` alone, at frame t of the episode, seen from ego pose."""
+        o = self.R.others(self.frame_at(t), self.ego_id)
+        m = o["trackId"] == track_id
+        return render_frame(self.ego_dict(tuple(pose)), {k: v[m] for k, v in o.items()}, None,
+                            self.cfg.render)[1].astype(np.float32) / 255.0
 
     # ---- metrics ----
     def metrics(self):
