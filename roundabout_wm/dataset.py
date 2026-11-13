@@ -37,7 +37,9 @@ class RounDWindows(Dataset):
     """n_pred overrides cfg.data.n_pred (e.g. 30 or 50 for longer rollouts); no cache rebuild needed."""
 
     def __init__(self, cache_dir: str, rec_ids: list[int], cfg: Config, stats: dict | None = None,
-                 n_pred: int | None = None):
+                 n_pred: int | None = None, inv_dir: str | None = None, inv_steps: int = 10):
+        """inv_dir: masks from scripts/build_inv_masks.py (action-invariance loss); items then also hold
+        inv_nr, inv_re (inv_steps, H, W) bool. None (default): unchanged."""
         self.cfg = cfg
         self.n_pred = n_pred or cfg.data.n_pred
         self.L = cfg.data.n_cond + self.n_pred
@@ -49,9 +51,20 @@ class RounDWindows(Dataset):
                    "actions": np.load(os.path.join(d, "actions.npy"))}
             w = window_starts(d, self.L, cfg.data.window_stride)
             index.append(np.stack([np.full(len(w), len(self.recs)), w], 1))
+            if inv_dir is not None:
+                st = np.load(os.path.join(inv_dir, f"rec_{r:02d}_starts.npy"))
+                pos = np.searchsorted(st, w)
+                if len(w) and ((pos >= len(st)).any() or (st[np.minimum(pos, len(st) - 1)] != w).any()):
+                    raise ValueError(f"{inv_dir}: masks of rec {r} miss some windows (rebuild with this cache)")
+                rec["inv_pos"] = dict(zip(w.tolist(), pos.tolist()))
+                rec["inv_nr"] = np.load(os.path.join(inv_dir, f"rec_{r:02d}_nr.npy"), mmap_mode="r")
+                rec["inv_re"] = np.load(os.path.join(inv_dir, f"rec_{r:02d}_re.npy"), mmap_mode="r")
+                if rec["inv_nr"].shape[1] < inv_steps:
+                    raise ValueError(f"{inv_dir}: masks have {rec['inv_nr'].shape[1]} steps < inv_steps {inv_steps}")
             self.recs.append(rec)
         self.index = np.concatenate(index) if index else np.zeros((0, 2), np.int64)
         self.stats = stats
+        self.inv_dir, self.inv_steps = inv_dir, inv_steps
 
     def __len__(self):
         return len(self.index)
@@ -66,7 +79,13 @@ class RounDWindows(Dataset):
         if self.stats is not None:
             speed = (speed - self.stats["speed_mean"]) / self.stats["speed_std"]
             actions = (actions - torch.tensor(self.stats["action_mean"])) / torch.tensor(self.stats["action_std"])
-        return {"images": images, "speed": speed, "actions": actions, "ego_state": state}
+        out = {"images": images, "speed": speed, "actions": actions, "ego_state": state}
+        if self.inv_dir is not None:
+            j, S = rec["inv_pos"][int(s)], self.cfg.render.size
+            for key in ("inv_nr", "inv_re"):
+                bits = np.unpackbits(np.asarray(rec[key][j, :self.inv_steps]), axis=-1)
+                out[key] = torch.from_numpy(bits.reshape(self.inv_steps, S, S).astype(bool))
+        return out
 
 
 def compute_stats(cache_dir: str, rec_ids: list[int], cfg: Config) -> dict:

@@ -9,6 +9,13 @@ Two-stage (PPUU-style warm start):
     python scripts/train_wm.py --cache $C --encoder cnn --run cnn_det --deterministic                  # stage 1
     python scripts/train_wm.py --cache $C --encoder cnn --run cnn_ws --init_from runs/cnn_det/best.pt   # stage 2
 
+Action-invariance loss (fix B for lead mirroring; roundabout_wm/invariance.py), off unless --inv_weight > 0:
+    python scripts/build_inv_masks.py --cache $C --data_dir $D --out $C/inv_masks                     # once, CPU
+    python scripts/train_wm.py --cache $C --encoder cnn --run cnn_inv --init_from runs/cnn_det/best.pt \
+        <stage-2 recipe> --inv_weight 0.1 --inv_masks $C/inv_masks
+Two extra 2 s rollouts per step (human vs counterfactual acceleration, z = prior mean); logs inv (the penalty),
+inv_area (share of pixels in the region) and inv_shift (mean ego displacement between the plans at the end, m).
+
 Rerunning the same command resumes from runs/<run>/last.pt (written every --ckpt_minutes), which is what makes
 #SBATCH --requeue and the Cloud Bursting idle shutdown survivable.
 
@@ -52,6 +59,7 @@ from torch.utils.data import DataLoader, Subset
 
 from roundabout_wm.config import Config
 from roundabout_wm.dataset import RounDWindows, load_stats
+from roundabout_wm.invariance import invariance_loss
 from roundabout_wm.models.world_model import GREEN, WMConfig, WorldModel, param_counts
 from roundabout_wm.wm_eval import swap_actions, warp_previous
 
@@ -116,6 +124,16 @@ def args_():
                         "every step (PPUU; used by all runs before Nov 4)")
     p.add_argument("--prior_sg", action=argparse.BooleanOptionalAction, default=True,
                    help="stop-gradient on prior samples in z-dropout training (--no-prior_sg for the ablation)")
+    p.add_argument("--inv_weight", type=float, default=0.0,
+                   help="action-invariance loss weight (roundabout_wm/invariance.py; 0 = off). Needs --inv_masks")
+    p.add_argument("--inv_masks", default=None, help="mask dir from scripts/build_inv_masks.py")
+    p.add_argument("--inv_steps", type=int, default=10, help="rollout steps of the invariance loss (10 = 2 s)")
+    p.add_argument("--inv_consts", default="-3,-1.5,0,1.5", help="constant counterfactual accelerations, m/s^2")
+    p.add_argument("--inv_human_frac", type=float, default=0.5,
+                   help="share of counterfactuals that use another window's human acceleration profile")
+    p.add_argument("--inv_fwd", type=int, default=8, help="px the region grows along the ego's forward axis")
+    p.add_argument("--inv_side", type=int, default=2, help="px the region grows sideways")
+    p.add_argument("--inv_near", type=int, default=2, help="px around other road users left out of the region")
     p.add_argument("--steps", type=int, default=60000, help="set after timing the first run; same for all runs")
     p.add_argument("--val_every", type=int, default=1000)
     p.add_argument("--val_batches", type=int, default=20)
@@ -131,6 +149,10 @@ def args_():
         a.enc_lr_mult = 0.1 if a.init_encoder else 1.0
     if a.deterministic and a.init_from:
         p.error("--init_from is for the stochastic stage 2; drop --deterministic")
+    if a.inv_weight > 0 and not a.inv_masks:
+        p.error("--inv_weight needs --inv_masks (scripts/build_inv_masks.py)")
+    if a.inv_weight > 0 and a.reencode:
+        p.error("--inv_weight does not support --reencode")
     return a
 
 
@@ -148,7 +170,8 @@ def loaders(a, cfg):
     else:
         print("WARNING: no stats.json, inputs are NOT normalised")
         stats = None
-    tr = RounDWindows(a.cache, split["train"], cfg, stats, n_pred=a.n_pred)
+    tr = RounDWindows(a.cache, split["train"], cfg, stats, n_pred=a.n_pred,
+                      inv_dir=a.inv_masks if a.inv_weight > 0 else None, inv_steps=a.inv_steps)
     va = RounDWindows(a.cache, split["val"], cfg, stats, n_pred=a.n_pred)
     if a.max_windows:
         tr, va = Subset(tr, range(min(a.max_windows, len(tr)))), Subset(va, range(min(a.max_windows, len(va))))
@@ -286,7 +309,7 @@ def gpu_util():
 
 LOG_FIELDS = (["step", "split", "beta", "loss", "mse", "mse_warm", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar",
                "mean_gap", "post_mu_abs", "prior_mu_abs", "post_mu_spread", "act_sens", "gap_mean", "s_per_step",
-               "gpu_util", "time", "elbo"]
+               "gpu_util", "time", "elbo", "inv", "inv_area", "inv_shift"]
               + [f"{m}@{k}" for k in REPORT_STEPS for m in ("prior", "post", "empty", "copy", "warp", "mass", "kl",
                                                              "std", "spread", "sharp")])
 
@@ -427,7 +450,8 @@ def main():
     if dev == "cuda":
         print(f"GPU {torch.cuda.get_device_name()} | {'bf16 autocast' if use_amp else 'fp32 (no native bf16)'}")
     keys = ("loss", "mse", "mse_warm", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar", "mean_gap", "post_mu_abs",
-            "prior_mu_abs", "post_mu_spread")
+            "prior_mu_abs", "post_mu_spread") + (("inv", "inv_area", "inv_shift") if a.inv_weight > 0 else ())
+    inv_consts = tuple(float(x) for x in a.inv_consts.split(","))
     last_ckpt, t0 = time.time(), time.time()
     run = {k: 0.0 for k in keys}; run_n = 0
     model.train()
@@ -437,6 +461,12 @@ def main():
             masks = model.fixed_dropout_masks() if a.dropout_masks == "sequence" else contextlib.nullcontext()
             with masks, torch.autocast(dev, dtype=torch.bfloat16, enabled=use_amp):
                 loss, logs = model.loss(b, a.n_pred, beta=beta_at(step, a))
+                if a.inv_weight > 0:                 # same dropout masks as the main loss (same block)
+                    inv, inv_logs = invariance_loss(model, b, stats, cfg.render, cfg.data.dt, H=a.inv_steps,
+                                                    consts=inv_consts, human_frac=a.inv_human_frac,
+                                                    fwd=a.inv_fwd, side=a.inv_side, near=a.inv_near)
+                    loss = loss + a.inv_weight * inv
+                    logs = logs | inv_logs | {"loss": loss.item()}
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss at step {step}: {logs}")
             opt.zero_grad(set_to_none=True)
@@ -454,7 +484,9 @@ def main():
                 gu = gpu_util()
                 print(f"step {step} | beta {beta_at(step, a):.1e} | loss {m['loss']:.5f} mse {m['mse']:.5f} warm {m['mse_warm']:.5f} "
                       f"kl {m['kl']:.1f} prior_std {m['prior_std']:.3f} | logvar post {m['post_logvar']:.2f} "
-                      f"prior {m['prior_logvar']:.2f} | {sps:.3f} s/step gpu {gu}%")
+                      f"prior {m['prior_logvar']:.2f} | {sps:.3f} s/step gpu {gu}%"
+                      + (f" | inv {m['inv']:.5f} area {m['inv_area']:.3f} shift {m['inv_shift']:.1f} m"
+                         if a.inv_weight > 0 else ""))
                 log.writerow({"step": step, "split": "train", "beta": beta_at(step, a), **m, "s_per_step": sps, "gpu_util": gu,
                               "time": time.time()})
                 log_f.flush()
