@@ -13,15 +13,21 @@ gain 1: the model shifts the road user exactly as the ego's action requires. gai
 ego in the picture, as if it copied the ego's acceleration. Between: partly.
 Groups (fixed at the start of the window, from the logged scene):
     lead          the nearest road user ahead in the ego's lane corridor (within 30 m)
+    follower      the nearest moving road user behind the ego in the same corridor (within 30 m)
     stationary    other road users that stand still for the whole 2 s (< 0.5 m/s): they cannot react to anything,
                   so their gain tests only whether the model applies the ego's own motion
     moving        all other road users
 Reading: lead ~0 with stationary and moving ~1 -> the model makes the lead mirror the ego (car-following leakage: an
 invented reaction). All ~0 -> the model under-applies the ego's own motion everywhere (action insensitivity).
+Followers are different: a real follower DOES react to the ego, so its right gain is below 1 and unknown (the "true"
+shift is the replay's, where nobody reacts). Read it by timing: a human needs ~1 s to react, so a plausible model has
+follower gain ~1 at 1 s and below 1 at 2 s; below 1 already at 1 s is an instant (invented) reaction.
+The corridor is straight in the ego's frame, so on the curved ring a lead or follower more than ~10-15 m away can
+fall outside it and land in "moving".
 The model's position: green (mean over samples x masks) inside the union of the road user's footprints under all
 five plans, dilated by 3 px, minus pixels near any other road user; skipped if the model's mass there is below
 --min_mass of the footprint area under the human's plan (the car has faded), or if the road user touches the image
-edge under any plan. --sanity real / glued checks the measurement itself (expect 1 / 0).
+edge, per plan (the human's plan must pass: it is the reference). --sanity real / glued checks the measurement itself (expect 1 / 0).
 Writes action_gain.csv next to the first checkpoint. Rendered rounD data: HPC / your own machine only.
 """
 import argparse
@@ -46,24 +52,31 @@ from roundabout_wm.render import render_frame, world_to_ego_px
 STEPS = (4, 9)                      # step index k <-> +(k + 1) * 0.2 s: 1 s and 2 s
 K3 = np.ones((7, 7), np.uint8)      # dilation by 3 px
 K2 = np.ones((5, 5), np.uint8)
+GROUPS = ("lead", "follower", "stationary", "moving")
 
 
 def groups(env, n_steps):
-    """{trackId: 'lead' | 'stationary' | 'moving'} for the road users present at the start of the episode."""
+    """{trackId: 'lead' | 'follower' | 'stationary' | 'moving'} for the road users present at the start of the
+    episode. The lead may be standing (a queue); a follower must move (a parked car behind cannot react)."""
     o = env.R.others(env.frame_at(0), env.ego_id)
     x, y, h = env.pose
     L, W = env.ego_size
-    out, best = {}, (np.inf, None)
+    out, best, behind = {}, (np.inf, None), (-np.inf, None)
     for j, tid in enumerate(o["trackId"]):
         tid = int(tid)
         fl = to_ego(np.array([o["x"][j], o["y"][j]]), x, y, h)
-        if 0 < fl[0] < 30 + L / 2 and abs(fl[1]) < W / 2 + CORRIDOR + o["width"][j] / 2 and fl[0] < best[0]:
-            best = (fl[0], tid)
         tr = env.R.tracks[tid]
         sp = tr[(tr.frame >= env.frame_at(0)) & (tr.frame <= env.frame_at(n_steps))].speed
         out[tid] = "stationary" if len(sp) and sp.abs().max() < 0.5 else "moving"
+        in_lane = abs(fl[1]) < W / 2 + CORRIDOR + o["width"][j] / 2
+        if in_lane and 0 < fl[0] < 30 + L / 2 and fl[0] < best[0]:
+            best = (fl[0], tid)
+        if in_lane and -(30 + L / 2) < fl[0] < 0 and fl[0] > behind[0] and out[tid] == "moving":
+            behind = (fl[0], tid)
     if best[1] is not None:
         out[best[1]] = "lead"
+    if behind[1] is not None:
+        out[behind[1]] = "follower"
     return out
 
 
@@ -104,19 +117,21 @@ def cases(env, ctx, rc, min_shift, min_mass, sanity=None):
                 true_c.append((c[1], c[0]))                           # (row, col)
             region &= ~near
             area = fps[0].sum()
-            edge = any(f[[0, -1]].any() or f[:, [0, -1]].any() for f in fps)
-            if area < 3 or region.sum() == 0 or edge:
-                continue                                              # out of view or cut by the image edge
-            model_c, ok = [], True
+            if area < 3 or region.sum() == 0:
+                continue                                              # out of view
+            # per plan: cut by the image edge, or faded in the model -> that plan is skipped (the human's plan
+            # must be usable, it is the reference). Followers often leave the view under "go" only.
+            model_c, ok = [], []
             for p in range(len(NAMES)):
-                wgt = G[p, k] * region
-                if wgt.sum() < min_mass * area:
-                    ok = False; break
-                model_c.append(((wgt * rr).sum() / wgt.sum(), (wgt * cc).sum() / wgt.sum()))
-            if not ok:
+                f, wgt = fps[p], G[p, k] * region
+                ok.append(not (f[[0, -1]].any() or f[:, [0, -1]].any()) and wgt.sum() >= min_mass * area)
+                model_c.append(((wgt * rr).sum() / wgt.sum(), (wgt * cc).sum() / wgt.sum()) if ok[p] else None)
+            if not ok[0]:
                 continue
             t0, m0 = np.array(true_c[0]), np.array(model_c[0])
             for p in range(1, len(NAMES)):
+                if not ok[p]:
+                    continue
                 dt_ = np.array(true_c[p]) - t0
                 dm = np.array(model_c[p]) - m0
                 n2 = float(dt_ @ dt_)
@@ -134,10 +149,10 @@ def report(df):
               f"frame, between plans (1 = right, 0 = glued to the ego)")
         for t, dt_ in d.groupby("t"):
             print(f"\n  at +{t:.0f} s   median gain [IQR] (n road users x plans)")
-            print(f"  {'plan':7s} " + " ".join(f"{g:>26s}" for g in ("lead", "stationary", "moving")))
+            print(f"  {'plan':7s} " + " ".join(f"{g:>26s}" for g in GROUPS))
             for plan in NAMES[1:]:
                 cells = []
-                for g in ("lead", "stationary", "moving"):
+                for g in GROUPS:
                     x = dt_[(dt_.plan == plan) & (dt_.group == g)].gain
                     cells.append(f"{x.median():6.2f} [{x.quantile(.25):5.2f},{x.quantile(.75):5.2f}] "
                                  f"(n {len(x):4d})" if len(x) else f"{'-':>26s}")
