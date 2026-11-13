@@ -28,7 +28,7 @@ The model's position: green (mean over samples x masks) inside the union of the 
 five plans, dilated by 3 px, minus pixels near any other road user; skipped if the model's mass there is below
 --min_mass of the footprint area under the human's plan (the car has faded), or if the road user touches the image
 edge, per plan (the human's plan must pass: it is the reference). --sanity real / glued checks the measurement itself (expect 1 / 0).
-Writes action_gain.csv next to the first checkpoint. Rendered rounD data: HPC / your own machine only.
+Writes action_gain.csv next to the first checkpoint (action_gain_sanity_<mode>.csv with --sanity). Rendered rounD data: HPC / your own machine only.
 """
 import argparse
 import json
@@ -204,7 +204,8 @@ def main():
                 print(f"  {run}: {j + 1}/{len(idx)} windows", end="\r")
         print()
     df = pd.DataFrame(rows)
-    out = os.path.join(os.path.dirname(os.path.abspath(a.ckpts[0])), "action_gain.csv")
+    name = f"action_gain_sanity_{a.sanity}.csv" if a.sanity else "action_gain.csv"     # never overwrite the model's
+    out = os.path.join(os.path.dirname(os.path.abspath(a.ckpts[0])), name)
     df.to_csv(out, index=False)
     report(df)
     print(f"\nwrote {out}")

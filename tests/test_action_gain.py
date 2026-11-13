@@ -55,7 +55,7 @@ def test_sanity_real_gives_gain_one_for_the_follower():
     S = _setup()
     _run("action_gain.py", "--ckpts", S["ck"], "--split", "val", "--n_windows", "40", "--samples", "1",
          "--masks", "1", "--sanity", "real")
-    d = pd.read_csv(os.path.join(os.path.dirname(S["ck"]), "action_gain.csv"))
+    d = pd.read_csv(os.path.join(os.path.dirname(S["ck"]), "action_gain_sanity_real.csv"))
     f = d[d.group == "follower"]
     assert len(f) > 0 and (f.gain - 1).abs().max() < 0.1
 
