@@ -8,8 +8,10 @@ receding car) that is p(its future | past): it must not depend on the action at 
 motion (the ego-centric frame moves with the ego).
 
 The loss. For a training window, roll the model out twice for H steps from the same warm-up state, with the
-human's actions a_h and with a counterfactual a' (another acceleration profile, the same route), z = the prior mean
-in both (the leak lives in the deterministic action pathway; learned and fixed priors mirror the same). Warp the a'
+human's actions a_h and with a counterfactual a' (another acceleration profile, the same route), z sampled from the
+prior with the SAME noise in both (z_mode "sample", v2). v1 used z = the detached prior mean: the model then drew
+empty frames at that (never otherwise trained) point and satisfied the loss there, while sampled rollouts kept most
+of the mirroring (ab_inv01, Nov 15). Warp the a'
 prediction into the a_h ego frame with the known ego poses (W), and penalise
     sum M * (W(pred(a')) - pred(a_h))^2 / sum M
 where M = the region around road users that cannot react (dilated, mostly along the ego's forward axis, where a
@@ -210,14 +212,20 @@ def region(nr, re, fwd=8, side=2, near=2):
 
 
 # ---- the loss --------------------------------------------------------------------------------------------------------
-def _rollout(model, h, actions, speeds, n, H, prev):
+def _rollout(model, h, actions, speeds, n, H, prev, z_mode="sample", eps=None):
+    """z_mode "sample": z = prior mean + prior std * eps[k] (eps shared between the two rollouts, so the action is the
+    only difference; gradients reach the prior head too). "mean": z = the detached prior mean (v1; caution: the exact
+    mean is a point the main loss never trains, and the model learned to draw empty frames there)."""
     greens = []
     for k in range(H):
         i = n - 1 + k
         if model.cfg.deterministic:
             z = model.zero_z(h.shape[0], h.device)
+        elif z_mode == "mean":
+            z = model.prior_params(h)[0].detach()
         else:
-            z = model.prior_params(h)[0].detach()                   # the prior mean; the prior head is not trained here
+            mu, lv = model.prior_params(h)
+            z = mu + (0.5 * lv).exp() * eps[k]
         h, g = model.rollout_step(h, z, actions[:, i], speeds[:, i], None, prev)
         greens.append(g)
         prev = g
@@ -225,7 +233,7 @@ def _rollout(model, h, actions, speeds, n, H, prev):
 
 
 def invariance_loss(model, batch, stats, rc, dt, H=10, consts=(-3.0, -1.5, 0.0, 1.5), human_frac=0.5,
-                    fwd=8, side=2, near=2, accel=None, generator=None):
+                    fwd=8, side=2, near=2, accel=None, generator=None, z_mode="sample"):
     """-> (loss, logs). batch needs inv_nr, inv_re (B, >= H, 64, 64) bool from the mask cache.
     Call inside the same fixed_dropout_masks() block as the main loss: both rollouts then use the same dropout masks
     (otherwise their difference would include dropout noise)."""
@@ -237,8 +245,12 @@ def invariance_loss(model, batch, stats, rc, dt, H=10, consts=(-3.0, -1.5, 0.0, 
     h0, _ = model.warmup(e, act, spd)
     prev = imgs[:, n - 1, GREEN:GREEN + 1]
     cf = counterfactual_actions(batch, stats, n, H, dt, consts, human_frac, accel, generator)
-    g_h = _rollout(model, h0, act, spd, n, H, prev)
-    g_c = _rollout(model, h0, cf["actions"], cf["speed"], n, H, prev)
+    eps = None
+    if not model.cfg.deterministic and z_mode == "sample":
+        shape = model.prior_params(h0)[0].shape
+        eps = [torch.randn(shape, device=h0.device, dtype=torch.float32) for _ in range(H)]
+    g_h = _rollout(model, h0, act, spd, n, H, prev, z_mode, eps)
+    g_c = _rollout(model, h0, cf["actions"], cf["speed"], n, H, prev, z_mode, eps)
     st0 = batch["ego_state"][:, n - 1].float()
     pose_h = integrate_poses(st0, *cf["human"], dt)
     pose_c = integrate_poses(st0, *cf["cf"], dt)
@@ -247,4 +259,13 @@ def invariance_loss(model, batch, stats, rc, dt, H=10, consts=(-3.0, -1.5, 0.0, 
     area = M.sum()
     loss = (M * (g_cw - g_h.float()) ** 2).sum() / area.clamp_min(1.0)
     shift = (pose_c[..., :2] - pose_h[..., :2]).norm(dim=-1)[:, -1].mean()
-    return loss, {"inv": loss.item(), "inv_area": (area / M[:, :, 0].numel()).item(), "inv_shift": shift.item()}
+    # guard against the empty-frame solution: predicted green on the true footprints of the cars that cannot react,
+    # relative to the truth (human rollout; the counterfactual warped into the same frame), ~1 when cars are drawn
+    with torch.no_grad():
+        core = batch["inv_nr"][:, :H].float()[:, :, None] * (valid > 0.99).float()
+        true = imgs[:, n:n + H, GREEN:GREEN + 1].float()
+        denom = (core * true).sum().clamp_min(1.0)
+        mass_h = ((core * g_h.float()).sum() / denom).item()
+        mass_c = ((core * g_cw).sum() / denom).item()
+    return loss, {"inv": loss.item(), "inv_area": (area / M[:, :, 0].numel()).item(), "inv_shift": shift.item(),
+                  "inv_mass_h": mass_h, "inv_mass_c": mass_c}
