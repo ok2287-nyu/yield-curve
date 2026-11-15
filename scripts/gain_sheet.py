@@ -85,6 +85,7 @@ def main():
     p.add_argument("--samples", type=int, default=4)
     p.add_argument("--masks", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--z_mean", action="store_true", help="z = the prior mean instead of samples (file names get _zmean)")
     p.add_argument("--out_dir", default="runs/gain_sheets")
     a = p.parse_args()
     if not a.windows and not a.csv:
@@ -95,6 +96,7 @@ def main():
     m = WorldModel(WMConfig(**s["wm_cfg"])).to(dev).eval()
     m.load_state_dict(s["model"])
     run = os.path.basename(os.path.dirname(os.path.abspath(a.ckpt)))
+    tag = run + ("_zmean" if a.z_mean else "")
     if a.windows:
         chosen, d = [(w, None) for w in a.windows], None
     else:
@@ -105,7 +107,7 @@ def main():
     T, n, steps = 10, cfg.data.n_cond, [1, 3, 5, 7, 9]                 # step index k <-> +(k + 1) * 0.2 s
     ip, il = NAMES.index(a.plan), NAMES.index("log")
     for w, tid in chosen:
-        r = score_window(m, s, env, w, T, a.samples, a.masks, a.seed, cc, cfg, dev)
+        r = score_window(m, s, env, w, T, a.samples, a.masks, a.seed, cc, cfg, dev, z_mode="mean" if a.z_mean else "sample")
         if r is None:
             print(f"window {w}: recording ends inside 2 s, skipped"); continue
         if tid is None:
@@ -143,7 +145,7 @@ def main():
                 row(where)]
         labels = ["real | human", "model | human", f"real | if {a.plan}", f"model | if {a.plan}",
                   f"model | {a.plan} #1", "where is it?"]
-        out = os.path.join(a.out_dir, f"gain_{run}_{a.group}_{a.plan}_w{w}.png")
+        out = os.path.join(a.out_dir, f"gain_{tag}_{a.group}_{a.plan}_w{w}.png")
         labelled_grid(rows, labels, [0.0] + [(k + 1) * cfg.data.dt for k in steps]).save(out)
         g = ""
         if d is not None:

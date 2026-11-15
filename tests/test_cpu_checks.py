@@ -86,3 +86,22 @@ def test_crash_check_and_bootstrap_scripts_run():
                         "--gain", os.path.join(run_dir, "g.csv"), "--boot", "50"], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
     assert "lead" in r.stdout and "brake" in r.stdout
+
+
+def test_z_mean_makes_samples_identical_and_action_gain_runs():
+    S = tag._setup()
+    ck = torch.load(S["ck"])
+    m = WorldModel(WMConfig(**ck["wm_cfg"])).eval()
+    m.load_state_dict(ck["model"])
+    env = ReplayEnv(S["cache"], S["raw"], [0], CFG, ck["stats"], horizon=10)
+    g_s = score_window(m, ck, env, 0, 10, 3, 1, 0, CostConfig(), CFG, "cpu")[1]["green"]
+    g_m = score_window(m, ck, env, 0, 10, 3, 1, 0, CostConfig(), CFG, "cpu", z_mode="mean")[1]["green"]
+    assert (g_s[0, 0] - g_s[0, 1]).abs().max() > 1e-6               # samples differ
+    assert (g_m[0, 0] - g_m[0, 1]).abs().max() < 1e-6               # the mean: all samples equal
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "action_gain.py"), "--cache", S["cache"],
+                        "--data_dir", S["raw"], "--ckpts", S["ck"], "--split", "val", "--n_windows", "10",
+                        "--samples", "1", "--masks", "1", "--z_mean"], capture_output=True, text=True,
+                       cwd=S["root"])
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
+    d = pd.read_csv(os.path.join(os.path.dirname(S["ck"]), "action_gain_zmean.csv"))
+    assert (d.run == "fake_zmean").all()

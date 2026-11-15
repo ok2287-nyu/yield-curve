@@ -114,7 +114,7 @@ def report(df, cc, contested):
                       f"real front collisions of the real-cheapest plan {r[4]:.3f}{tag}")
 
 
-def score_window(m, s, env, i, T, samples, masks, seed, cc, cfg, dev, real_cache=None, run=""):
+def score_window(m, s, env, i, T, samples, masks, seed, cc, cfg, dev, real_cache=None, run="", z_mode="sample"):
     """The five plans of window i, scored on imagined and on real futures.
     -> (rows, ctx) with ctx = dict(paths, model green (M, S, P, T, 64, 64), real = env.open_loop(...)), or None if
     the recording ends inside the horizon. Leaves env reset to window i."""
@@ -131,7 +131,7 @@ def score_window(m, s, env, i, T, samples, masks, seed, cc, cfg, dev, real_cache
         real_cache[i] = env.open_loop(paths["state"][:, :, 3])
     real = real_cache[i]
     h, prev = warm_states(m, [it], cfg, dev)
-    out = imagine(m, h, paths, s["stats"], cfg, samples, masks, seed=seed + i, prev0=prev)
+    out = imagine(m, h, paths, s["stats"], cfg, samples, masks, seed=seed + i, prev0=prev, z_mode=z_mode)
     raw_prev = float(it["actions"][n - 2, 0] * s["stats"]["action_std"][0] + s["stats"]["action_mean"][0])
     cm = plan_costs(out["green"], out["speed"], out["acc"], out["curv"], cfg.render, cc, acc_prev=raw_prev)
     cr = {}

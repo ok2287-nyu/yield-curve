@@ -62,9 +62,13 @@ def _share_masks(model, M, rep):
             mod.mask = mod.mask.repeat_interleave(rep, 0)
 
 
-def imagine(model, h0, paths, stats, cfg, n_samples=4, n_masks=1, seed=0, prev0=None, grad=False):
+def imagine(model, h0, paths, stats, cfg, n_samples=4, n_masks=1, seed=0, prev0=None, grad=False, z_mode="sample"):
     """h0 (1, C, 8, 8): model state at the start (after the real warm-up). paths: ego_paths(...).
-    prev0 (1, 1, 64, 64): the current green frame (residual decoder only). -> dict green, speed, acc, curv."""
+    prev0 (1, 1, 64, 64): the current green frame (residual decoder only). -> dict green, speed, acc, curv.
+    z_mode "sample" (default): z drawn from the prior; "mean": z = the prior mean (diagnostics: the deterministic
+    action pathway alone, with the prior head's mean but none of its spread)."""
+    if z_mode not in ("sample", "mean"):
+        raise ValueError(f"z_mode {z_mode}")
     if model.cfg.reencode:
         raise NotImplementedError("reencode models need rendered frames inside the rollout")
     if model.cfg.z_seq:
@@ -101,7 +105,7 @@ def imagine(model, h0, paths, stats, cfg, n_samples=4, n_masks=1, seed=0, prev0=
                     mu, lv = model.prior_params(h)
                     eps = torch.randn((SP,) + tuple(mu.shape[1:]), generator=g, device=dev).repeat(
                         (M,) + (1,) * (mu.dim() - 1))
-                    z = mu + (0.5 * lv).exp() * eps
+                    z = mu if z_mode == "mean" else mu + (0.5 * lv).exp() * eps
                 h, gr = model.rollout_step(h, z, act_b[:, t], spd_b[:, t:t + 1], prev=prev)
                 prev = gr
                 greens.append(gr[:, 0].float())
