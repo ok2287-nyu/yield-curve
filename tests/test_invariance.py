@@ -187,3 +187,46 @@ def test_train_wm_smoke_with_the_invariance_loss():
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
     assert os.path.exists(os.path.join(run, "inv", "last.pt"))
     assert "inv" in pd.read_csv(os.path.join(run, "inv", "log.csv")).columns
+
+
+def test_v2_sampled_z_zero_for_human_actions_grad_to_prior_and_mass_guard():
+    """v2 (z_mode 'sample'): shared noise -> loss 0 for the human's own actions; with another action the gradient
+    reaches the prior head; the mass guard is ~1 when the 'prediction' is the truth, ~0 for empty frames."""
+    S = _setup()
+    ds = RounDWindows(S["cache"], [0], CFG, S["stats"], inv_dir=S["inv"])
+    b = _batch(ds, [0, 3, 6])
+    n, H = CFG.data.n_cond, 10
+    acc_h = b["actions"][:, n - 1:n - 1 + H, 0] * S["stats"]["action_std"][0] + S["stats"]["action_mean"][0]
+    m = _model().train()
+    with m.fixed_dropout_masks():
+        l0, logs = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=acc_h, z_mode="sample")
+    assert l0.item() < 1e-6 and {"inv_mass_h", "inv_mass_c"} <= set(logs)
+    m.zero_grad()
+    l1, _ = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=torch.full((3, H), -3.0),
+                            z_mode="sample")
+    l1.backward()
+    prior_grad = sum(p.grad.abs().sum() for name, p in m.named_parameters() if "prior" in name and p.grad is not None)
+    assert l1.item() > 1e-6 and prior_grad > 0
+    # v1 still available
+    l_mean, _ = invariance_loss(m.eval(), b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=acc_h, z_mode="mean")
+    assert l_mean.item() < 1e-6
+
+
+def test_mass_guard_detects_empty_frames():
+    import roundabout_wm.invariance as inv
+    S = _setup()
+    ds = RounDWindows(S["cache"], [0], CFG, S["stats"], inv_dir=S["inv"])
+    b = _batch(ds, [0])
+    n, H = CFG.data.n_cond, 10
+    acc_h = b["actions"][:, n - 1:n - 1 + H, 0] * S["stats"]["action_std"][0] + S["stats"]["action_mean"][0]
+    m = _model(det=True).eval()
+    orig = inv._rollout
+    truth = b["images"][:, n:n + H, 1:2].float()
+    try:
+        inv._rollout = lambda *a, **k: truth.clone()               # a "model" that predicts the true frames
+        _, good = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=acc_h)
+        inv._rollout = lambda *a, **k: torch.zeros_like(truth)     # one that draws nothing
+        _, empty = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=acc_h)
+    finally:
+        inv._rollout = orig
+    assert good["inv_mass_h"] > 0.8 and empty["inv_mass_h"] < 0.01
