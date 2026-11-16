@@ -41,6 +41,7 @@ from roundabout_wm.config import Config
 from roundabout_wm.controller.cost import CostConfig, plan_costs
 from roundabout_wm.controller.imagine import ego_paths, imagine, route_from_item, warm_states
 from roundabout_wm.controller.replay import ReplayEnv
+from roundabout_wm.controller.warp_plan import warp_imagine
 from roundabout_wm.models.world_model import WMConfig, WorldModel
 
 PLANS = {"brake": -3.0, "gentle": -1.5, "coast": 0.0, "go": 1.5}
@@ -114,7 +115,8 @@ def report(df, cc, contested):
                       f"real front collisions of the real-cheapest plan {r[4]:.3f}{tag}")
 
 
-def score_window(m, s, env, i, T, samples, masks, seed, cc, cfg, dev, real_cache=None, run="", z_mode="sample"):
+def score_window(m, s, env, i, T, samples, masks, seed, cc, cfg, dev, real_cache=None, run="", z_mode="sample",
+                 warp_ref=None):
     """The five plans of window i, scored on imagined and on real futures.
     -> (rows, ctx) with ctx = dict(paths, model green (M, S, P, T, 64, 64), real = env.open_loop(...)), or None if
     the recording ends inside the horizon. Leaves env reset to window i."""
@@ -131,7 +133,11 @@ def score_window(m, s, env, i, T, samples, masks, seed, cc, cfg, dev, real_cache
         real_cache[i] = env.open_loop(paths["state"][:, :, 3])
     real = real_cache[i]
     h, prev = warm_states(m, [it], cfg, dev)
-    out = imagine(m, h, paths, s["stats"], cfg, samples, masks, seed=seed + i, prev0=prev, z_mode=z_mode)
+    if warp_ref:                                    # predict-then-warp baseline (controller/warp_plan.py)
+        out = warp_imagine(m, h, paths, s["stats"], cfg, samples, masks, seed=seed + i, prev0=prev, ref=warp_ref,
+                           z_mode=z_mode, names=tuple(NAMES))
+    else:
+        out = imagine(m, h, paths, s["stats"], cfg, samples, masks, seed=seed + i, prev0=prev, z_mode=z_mode)
     raw_prev = float(it["actions"][n - 2, 0] * s["stats"]["action_std"][0] + s["stats"]["action_mean"][0])
     cm = plan_costs(out["green"], out["speed"], out["acc"], out["curv"], cfg.render, cc, acc_prev=raw_prev)
     cr = {}
@@ -173,6 +179,9 @@ def main():
     p.add_argument("--horizon", type=int, default=10)
     p.add_argument("--contested", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--warp_ref", choices=["coast", "mix"], default=None,
+                   help="predict-then-warp baseline: roll out only the reference plan(s), warp to every plan; runs are "
+                        "named <run>_warp<ref>, csv gets the same suffix")
     p.add_argument("--csv", default=None, help="skip the rollouts and only report from this plan_rank.csv")
     a = p.parse_args()
     cfg, cc = Config(), CostConfig()
@@ -186,7 +195,7 @@ def main():
         s = torch.load(path, map_location=dev)
         m = WorldModel(WMConfig(**s["wm_cfg"])).to(dev).eval()
         m.load_state_dict(s["model"])
-        run = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        run = os.path.basename(os.path.dirname(os.path.abspath(path))) + (f"_warp{a.warp_ref}" if a.warp_ref else "")
         key = json.dumps(s["stats"], sort_keys=True)
         if key not in envs:
             envs[key] = ReplayEnv(a.cache, a.data_dir, split, cfg, s["stats"], horizon=T)
@@ -194,14 +203,14 @@ def main():
         idx = np.sort(np.random.default_rng(a.seed).choice(len(env.ds), min(a.n_windows, len(env.ds)),
                                                            replace=False))
         for j, i in enumerate(idx):
-            r = score_window(m, s, env, int(i), T, a.samples, a.masks, a.seed, cc, cfg, dev, real_cache, run)
+            r = score_window(m, s, env, int(i), T, a.samples, a.masks, a.seed, cc, cfg, dev, real_cache, run, warp_ref=a.warp_ref)
             if r is not None:
                 rows.extend(r[0])
             if (j + 1) % 25 == 0:
                 print(f"  {run}: {j + 1}/{len(idx)} windows", end="\r")
         print()
     df = pd.DataFrame(rows)
-    out = os.path.join(os.path.dirname(os.path.abspath(a.ckpts[0])), "plan_rank.csv")
+    out = os.path.join(os.path.dirname(os.path.abspath(a.ckpts[0])), "plan_rank" + (f"_warp{a.warp_ref}" if a.warp_ref else "") + ".csv")
     df.to_csv(out, index=False)
     report(df, cc, a.contested)
     print(f"\nwrote {out}")
