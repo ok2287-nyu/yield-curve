@@ -56,7 +56,7 @@ def ego_footprint(rc, cc: CostConfig):
 def proximity_mask(speed, rc, cc: CostConfig):
     """speed (...,) m/s -> (..., 64, 64) proximity weights."""
     speed = torch.as_tensor(speed, dtype=torch.float32)
-    idx = torch.arange(rc.size, dtype=torch.float32)
+    idx = torch.arange(rc.size, dtype=torch.float32, device=speed.device)     # on the speed's device (GPU eval)
     fwd = (rc.ego_row - idx)[:, None].expand(rc.size, rc.size) * rc.m_per_px          # metres ahead of the centre
     lat = (rc.ego_col - idx)[None, :].expand(rc.size, rc.size).abs() * rc.m_per_px    # metres to the side
     front, back, hw = cc.ego_length / 2, -cc.ego_length / 2, cc.ego_width / 2
