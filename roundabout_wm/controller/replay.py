@@ -9,7 +9,14 @@
 The ego drives along the human's own path (the logged positions of the ego track from the last warm-up frame on),
 by distance travelled; the controller chooses only the acceleration (steering = the human's route, as in the
 planner). Every other road user is replayed from the log, so nobody reacts to the ego: the known limitation of log
-replay, which the collision classes below keep visible. Frames are rendered exactly as the training cache was
+replay, which the collision classes below keep visible.
+
+reactive=True (off by default) is the opposite bound: every road user except pedestrians keeps its own logged path
+and its logged timing, but brakes (IDM interaction term) whenever the ego, or a road user the ego has already
+delayed, is closer ahead in its lane than in the log. ReactiveSim below. Under the human's own plan nothing is
+closer than in the log, so the replay stays exact; it only ever slows road users down (they then catch up with their
+log at no more than a_max). Replay = nobody yields to the ego; reactive = everybody brakes for it once it is in their
+path. Real drivers are in between. Frames are rendered exactly as the training cache was
 (render.render_frame with the recording's road map), so at the human's own pose a frame equals the cached one.
 
 Collisions: oriented-rectangle overlap (separating axes) of the ego's box with every road user's box, classified by
@@ -183,16 +190,155 @@ class _Recording:
         return {k: v[m] for k, v in o.items()}
 
 
+# ---- reactive road users (reactive=True) -------------------------------------------------------------------------
+REACT = dict(s0=2.0, t_head=1.0, a_max=2.0, b_comf=2.0, b_max=8.0)   # IDM: m, s, m/s^2 (catch-up), m/s^2, m/s^2
+NON_REACTIVE = ("pedestrian",)
+
+
+def lane_gaps(agent, bodies):
+    """agent dict (scalars x, y, heading, length, width); bodies dict of arrays (N,) -> (N,) metres from the agent's
+    front to the nearest part of each body inside the agent's lane corridor ahead (inf if none). front_gap per body."""
+    if not len(bodies["x"]):
+        return np.zeros(0)
+    pts = box_points(car_corners(bodies["x"], bodies["y"], bodies["heading"], bodies["length"], bodies["width"]))
+    fl = to_ego(pts, agent["x"], agent["y"], agent["heading"])                   # (N, 9, 2)
+    ok = (np.abs(fl[..., 1]) < agent["width"] / 2 + CORRIDOR) & (fl[..., 0] > 0)
+    d = np.where(ok, fl[..., 0], np.inf).min(1) - agent["length"] / 2
+    return np.where(np.isfinite(d), np.maximum(d, 0.0), np.inf)
+
+
+def idm_brake(v, gaps, gaps_log, v_lead, p=REACT):
+    """IDM interaction term against each leader, with the desired gap capped at the gap the road user accepted in
+    the log (so the logged behaviour itself is never braked). -> the most negative acceleration (<= 0), or 0."""
+    a = 0.0
+    for g, gl, vl in zip(gaps, gaps_log, v_lead):
+        if not np.isfinite(g):
+            continue
+        s_star = p["s0"] + max(0.0, v * p["t_head"] + v * (v - vl) / (2 * np.sqrt(p["a_max"] * p["b_comf"])))
+        s_star = min(s_star, gl)
+        a = min(a, p["a_max"] * (1.0 - (s_star / max(g, 0.1)) ** 2))
+    return max(a, -p["b_max"])
+
+
+class _Agent:
+    def __init__(self, tid, g, f0, step, length, width, reactive):
+        """g: the road user's logged rows inside the episode (frames f0 + k * step, contiguous)."""
+        self.tid, self.length, self.width, self.reactive = tid, length, width, reactive
+        self.k0 = int((int(g.frame.iloc[0]) - f0) // step)                       # first episode step it exists
+        self.raw = g[["x", "y", "heading"]].to_numpy(np.float64)                  # (L, 3)
+        self.path = HumanPath(self.raw[:, :2], self.raw[:, 2], g.speed.to_numpy(np.float64))
+        self.s_log = self.path.s                                                  # (L,) arc length at each row
+        self.s, self.v = 0.0, float(g.speed.iloc[0])
+
+    def alive(self, t):
+        return self.k0 <= t < self.k0 + len(self.raw)
+
+    def logged(self, t):
+        return self.raw[t - self.k0]
+
+    def on_log(self, t):
+        return abs(self.s - self.s_log[t - self.k0]) < 1e-6
+
+    def pose(self, t):
+        return tuple(self.logged(t)) if self.on_log(t) else self.path.pose(self.s)
+
+
+class ReactiveSim:
+    """The road users of one episode, stepped together with the ego (one plan). others() = log replay until the ego
+    gets closer to someone than it was in the log."""
+
+    def __init__(self, R, ego_id, f0, step, T, ego_log, dt, p=REACT):
+        """ego_log (L, 3): the human's logged poses from the episode start (the tolerance reference)."""
+        self.p, self.dt, self.t, self.ego_log = p, dt, 0, np.asarray(ego_log, dtype=np.float64)
+        cls = R.meta["class"] if "class" in R.meta else None
+        self.agents = []
+        for tid, g in R.tracks.items():
+            if tid == ego_id:
+                continue
+            g = g[(g.frame >= f0) & (g.frame <= f0 + T * step)]
+            if not len(g):
+                continue
+            c = str(cls.get(tid, "car")) if cls is not None else "car"
+            self.agents.append(_Agent(int(tid), g, f0, step, float(R.meta.at[tid, "length"]),
+                                      float(R.meta.at[tid, "width"]), c not in NON_REACTIVE))
+
+    def others(self):
+        a = [x for x in self.agents if x.alive(self.t)]
+        if not a:
+            return {k: np.zeros(0) for k in ("trackId", "x", "y", "heading", "length", "width")}
+        pose = np.array([x.pose(self.t) for x in a])
+        return {"trackId": np.array([x.tid for x in a]), "x": pose[:, 0], "y": pose[:, 1], "heading": pose[:, 2],
+                "length": np.array([x.length for x in a]), "width": np.array([x.width for x in a])}
+
+    def delayed(self):
+        """trackIds of road users that are off their log (only ever behind it)."""
+        return [x.tid for x in self.agents if x.alive(self.t) and not x.on_log(self.t)]
+
+    def advance(self, ego, v_ego):
+        """ego dict at step t (x, y, heading, length, width), its speed -> road users at step t + 1."""
+        t, p, dt = self.t, self.p, self.dt
+        live = [x for x in self.agents if x.alive(t)]
+        st = {x.tid: (*x.pose(t), x.v) for x in live}
+        off = [x for x in live if not x.on_log(t)]
+        el = self.ego_log[t] if t < len(self.ego_log) else None
+        new = {}
+        for x in live:
+            if not x.alive(t + 1):
+                continue
+            k = t + 1 - x.k0
+            s_next = x.s_log[k]
+            if not x.reactive:
+                new[x.tid] = (s_next, (s_next - x.s) / dt)
+                continue
+            xs, ys, hs, vs = st[x.tid]
+            me = dict(x=xs, y=ys, heading=hs, length=x.length, width=x.width)
+            lead = [(ego["x"], ego["y"], ego["heading"], ego["length"], ego["width"], v_ego,
+                     tuple(el) if el is not None else None)]
+            for o in off:
+                if o.tid != x.tid:
+                    ox, oy, oh, ov = st[o.tid]
+                    lead.append((ox, oy, oh, o.length, o.width, ov, tuple(o.logged(t))))
+            arr = np.array([l[:5] for l in lead])
+            bodies = dict(x=arr[:, 0], y=arr[:, 1], heading=arr[:, 2], length=arr[:, 3], width=arr[:, 4])
+            gaps = lane_gaps(me, bodies)
+            # the same leaders at their logged poses, seen from this road user's logged pose: the gap it accepted
+            mx, my, mh = x.logged(t)
+            me_log = dict(me, x=mx, y=my, heading=mh)
+            gl = np.full(len(lead), np.inf)
+            for j, l in enumerate(lead):
+                if l[6] is not None:
+                    gl[j] = lane_gaps(me_log, dict(x=np.array([l[6][0]]), y=np.array([l[6][1]]),
+                                                   heading=np.array([l[6][2]]), length=np.array([l[3]]),
+                                                   width=np.array([l[4]])))[0]
+            vl = [l[5] * np.cos(l[2] - hs) for l in lead]
+            v_free = max((s_next - x.s) / dt, 0.0)
+            if x.s < x.s_log[t - x.k0] - 1e-6:                    # behind its log: catch up gently
+                v_free = min(v_free, vs + p["a_max"] * dt)
+            a = idm_brake(vs, gaps, gl, vl, p)
+            v_new = min(v_free, max(vs + a * dt, 0.0)) if a < 0 else v_free
+            new[x.tid] = (x.s + v_new * dt if v_new < v_free else s_next, v_new)
+        for x in live:
+            if x.tid in new:
+                x.s, x.v = new[x.tid]
+        self.t = t + 1
+        for x in self.agents:                                    # road users entering the scene start on their log
+            if x.k0 == self.t:
+                x.s = 0.0
+
+
 class ReplayEnv:
     def __init__(self, cache_dir, data_dir, rec_ids, cfg, stats=None, horizon=30, road=True, recordings=None,
-                 stop_on_collision=True):
+                 stop_on_collision=True, reactive=False):
         """horizon: control steps per episode (30 = 6 s) after the warm-up; shorter if the recording ends.
         stop_on_collision: end the episode at the first overlap (after it, a replayed car passes through the ego and
         would be counted again, in another class).
-        recordings: optional {rec_id: object like _Recording} (tests)."""
+        recordings: optional {rec_id: object like _Recording} (tests).
+        reactive: road users react to the ego (ReactiveSim); default False = pure log replay."""
         self.cfg, self.cache_dir, self.data_dir, self.rec_ids = cfg, cache_dir, data_dir, list(rec_ids)
         self.ds = RounDWindows(cache_dir, self.rec_ids, cfg, stats, n_pred=cfg.data.n_pred)
         self.horizon, self.use_road, self.stop_on_collision = horizon, road, stop_on_collision
+        self.reactive = reactive
+        self.sim, self._plan_others = None, None
         self._recs = dict(recordings or {})
         self._tracks_csv = {}
 
@@ -236,8 +382,23 @@ class ReplayEnv:
         self.exact = True                 # still exactly on the human's logged trajectory
         self.done, self.reason = self.T <= 0, ("log_end" if self.T <= 0 else None)
         self.log = []
+        self.sim = self._new_sim() if self.reactive else None
+        self._plan_others = None
         self._record(acc=np.nan, curv=np.nan)
         return self.obs()
+
+    def _new_sim(self):
+        ego_log = np.stack([self.path.xy[:, 0], self.path.xy[:, 1], self.path.heading], 1)
+        return ReactiveSim(self.R, self.ego_id, self.f0, self.cfg.data.step, self.T, ego_log, self.cfg.data.dt)
+
+    def others_at(self, t, plan=None):
+        """Road users at episode step t: the log, or (reactive) the closed-loop simulation's current step, or the
+        road users of open_loop plan `plan` (after open_loop; the log when not reactive)."""
+        if self.reactive and plan is not None and self._plan_others is not None:
+            return self._plan_others[plan][t]
+        if self.reactive and plan is None and self.sim is not None and t == self.sim.t:
+            return self.sim.others()
+        return self.R.others(self.frame_at(t), self.ego_id)
 
     def ego_dict(self, pose=None):
         x, y, h = pose or self.pose
@@ -249,7 +410,7 @@ class ReplayEnv:
     def render(self, pose=None, t=None):
         t = self.t if t is None else t
         road = self.R.road if self.use_road else None
-        return render_frame(self.ego_dict(pose), self.R.others(self.frame_at(t), self.ego_id), road, self.cfg.render)
+        return render_frame(self.ego_dict(pose), self.others_at(t), road, self.cfg.render)
 
     def obs(self):
         """image uint8 (3, 64, 64) at the current pose; state x, y, heading, speed; the action (acc, curv) that led
@@ -264,6 +425,8 @@ class ReplayEnv:
             raise RuntimeError("episode is over")
         d, dt = self.cfg.data, self.cfg.data.dt
         v0, h0 = self.v, self.pose[2]
+        if self.sim is not None:
+            self.sim.advance(self.ego_dict(), self.v)        # road users react to the ego as it is now (0.2 s delay)
         if accel is None:
             if not self.exact:
                 raise RuntimeError("env.step(None) only while the ego is still on the human's trajectory")
@@ -295,7 +458,7 @@ class ReplayEnv:
         return self.obs()
 
     def _record(self, acc, curv):
-        others = self.R.others(self.frame_at(self.t), self.ego_id)
+        others = self.others_at(self.t)
         ego = self.ego_dict()
         self.log.append(dict(t=self.t, s=self.s, v=self.v, acc=acc, curv=curv, x=self.pose[0], y=self.pose[1],
                              heading=self.pose[2], gap=front_gap(ego, others), hits=collisions(ego, others)))
@@ -306,7 +469,9 @@ class ReplayEnv:
            green_nf the same without followers (road users whose centre is more than a quarter of the ego's length
            behind the ego's centre: a plan that slows down is not charged for the logged follower driving into it);
            front, side, rear (P, T) bool collisions; hit_ids[p][t] list of (trackId, class); gap (P, T) metres.
-        Steps past the end of the recording are dropped (T shrinks)."""
+        Steps past the end of the recording are dropped (T shrinks).
+        reactive: every plan gets its own ReactiveSim (road users react to that plan); delayed[p][t] lists the
+        trackIds the plan has slowed down (empty lists when not reactive)."""
         dt, step = self.cfg.data.dt, self.cfg.data.step
         speeds = np.asarray(speeds, dtype=np.float64)
         P, T = speeds.shape[0], min(speeds.shape[1] - 1, (self.R.last_frame - self.f0) // step)
@@ -318,9 +483,19 @@ class ReplayEnv:
         hits = {c: np.zeros((P, T), bool) for c in ("front", "side", "rear")}
         hit_ids = [[[] for _ in range(T)] for _ in range(P)]
         gap = np.full((P, T), np.inf)
-        for t in range(T):
-            others = self.R.others(self.frame_at(t + 1), self.ego_id)
+        delayed = [[[] for _ in range(T)] for _ in range(P)]
+        if self.reactive:
+            self._plan_others = [[None] * (T + 1) for _ in range(P)]
             for p in range(P):
+                sim = self._new_sim()
+                self._plan_others[p][0] = sim.others()
+                for t in range(T):
+                    sim.advance(self.ego_dict(tuple(poses[p, t])), float(speeds[p, t]))
+                    self._plan_others[p][t + 1] = sim.others()
+                    delayed[p][t] = sim.delayed()
+        for t in range(T):
+            for p in range(P):
+                others = self.others_at(t + 1, p) if self.reactive else self.R.others(self.frame_at(t + 1), self.ego_id)
                 ego = self.ego_dict(tuple(poses[p, t + 1]))
                 green[p, t] = render_frame(ego, others, None, self.cfg.render)[1]
                 fwd = to_ego(np.stack([others["x"], others["y"]], -1), ego["x"], ego["y"], ego["heading"])[..., 0] \
@@ -332,11 +507,18 @@ class ReplayEnv:
                     hits[c][p, t] = True
                     hit_ids[p][t].append((tid, c))
                 gap[p, t] = front_gap(ego, others)
-        return {"green": green, "green_nf": green_nf, "poses": poses, "gap": gap, "hit_ids": hit_ids, **hits}
+        return {"green": green, "green_nf": green_nf, "poses": poses, "gap": gap, "hit_ids": hit_ids,
+                "delayed": delayed, "others": self._plan_others if self.reactive else None, **hits}
 
-    def footprint(self, track_id, pose, t):
-        """(64, 64) float in [0, 1]: road user `track_id` alone, at frame t of the episode, seen from ego pose."""
-        o = self.R.others(self.frame_at(t), self.ego_id)
+    def use_plans(self, real):
+        """After reset, reuse a cached open_loop result of this window: footprint(plan=...) then follows its
+        simulated road users again (reset forgets them)."""
+        self._plan_others = real.get("others")
+
+    def footprint(self, track_id, pose, t, plan=None):
+        """(64, 64) float in [0, 1]: road user `track_id` alone, at frame t of the episode, seen from ego pose.
+        plan: with reactive=True, where that road user is under open_loop plan `plan` (else the log)."""
+        o = self.others_at(t, plan) if plan is not None else self.R.others(self.frame_at(t), self.ego_id)
         m = o["trackId"] == track_id
         return render_frame(self.ego_dict(tuple(pose)), {k: v[m] for k, v in o.items()}, None,
                             self.cfg.render)[1].astype(np.float32) / 255.0

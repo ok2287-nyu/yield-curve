@@ -52,10 +52,11 @@ def main():
     p.add_argument("--near", type=float, default=15.0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="replay_eval.csv")
+    p.add_argument("--reactive", action="store_true", help="road users react to the ego (ReplayEnv(reactive=True))")
     a = p.parse_args()
     cfg = Config()
     split = json.load(open(os.path.join(a.cache, "split.json")))[a.split]
-    env = ReplayEnv(a.cache, a.data_dir, split, cfg, horizon=a.horizon)
+    env = ReplayEnv(a.cache, a.data_dir, split, cfg, horizon=a.horizon, reactive=a.reactive)
     idx = np.sort(np.random.default_rng(a.seed).choice(len(env.ds), min(a.n_windows, len(env.ds)), replace=False))
     rows = []
     for j, i in enumerate(idx):

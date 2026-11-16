@@ -55,11 +55,21 @@ def spearman(a, b):
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
+def ref_col(d):
+    """The real risk plans are ranked on: with reactive road users (run name *_react) the full real risk (followers
+    brake with the ego, so they no longer need deleting); in plain replay real* (followers deleted)."""
+    runs = d["run"].astype(str) if "run" in d else None
+    if runs is not None and len(runs) and runs.str.contains("_react").all():
+        return "real_risk"
+    return "real_risk_nf" if "real_risk_nf" in d else "real_risk"
+
+
 def total(d, cc, w_prog=None, w_acc=None, w_jerk=None, kind="real"):
     w_prog = cc.w_prog if w_prog is None else w_prog
     w_acc = cc.w_acc if w_acc is None else w_acc
     w_jerk = cc.w_jerk if w_jerk is None else w_jerk
-    risk = d["real_risk_nf"] if kind == "real" and "real_risk_nf" in d else d[f"{kind}_risk"]
+    ref = ref_col(d) if kind == "real" else f"{kind}_risk"
+    risk = d[ref]
     return risk + w_prog * d.progress + w_acc * d.acc2 + w_jerk * d.jerk2
 
 
@@ -67,9 +77,16 @@ def report(df, cc, contested):
     if "real_risk_nf" not in df:
         df = df.assign(real_risk_nf=df.real_risk)       # csv from before the follower mask
     for run, d in df.groupby("run", sort=False):
+        rc = ref_col(d)
+        if rc == "real_risk":       # reactive road users: rank against the full real risk, printed in the real* column
+            d = d.assign(real_risk_nf=d.real_risk)
         cont = d.groupby("window").real_risk_nf.transform("max") > contested
+        what = "with reactive road users" if rc == "real_risk" else "without followers"
         print(f"\n===== {run}: {d.window.nunique()} windows, {d[cont].window.nunique()} contested "
-              f"(some plan's real risk without followers > {contested})")
+              f"(some plan's real risk {what} > {contested})")
+        if rc == "real_risk" and "n_delayed" in d:
+            print("  reactive: road users slowed by the plan (mean count at the horizon): " + ", ".join(
+                f"{k} {v:.2f}" for k, v in d.groupby("plan").n_delayed.mean().reindex(NAMES).items()))
         for label, sub in (("all", d), ("contested", d[cont])):
             if sub.empty:
                 continue
@@ -117,6 +134,8 @@ def report(df, cc, contested):
 
 def score_window(m, s, env, i, T, samples, masks, seed, cc, cfg, dev, real_cache=None, run="", z_mode="sample",
                  warp_ref=None):
+    # env.reactive: the real futures have road users that react to each plan (ReactiveSim); real_risk is then the
+    # reference and n_delayed counts the road users each plan slowed down
     """The five plans of window i, scored on imagined and on real futures.
     -> (rows, ctx) with ctx = dict(paths, model green (M, S, P, T, 64, 64), real = env.open_loop(...)), or None if
     the recording ends inside the horizon. Leaves env reset to window i."""
@@ -132,6 +151,7 @@ def score_window(m, s, env, i, T, samples, masks, seed, cc, cfg, dev, real_cache
     if i not in real_cache:
         real_cache[i] = env.open_loop(paths["state"][:, :, 3])
     real = real_cache[i]
+    env.use_plans(real)
     h, prev = warm_states(m, [it], cfg, dev)
     if warp_ref:                                    # predict-then-warp baseline (controller/warp_plan.py)
         out = warp_imagine(m, h, paths, s["stats"], cfg, samples, masks, seed=seed + i, prev0=prev, ref=warp_ref,
@@ -157,7 +177,8 @@ def score_window(m, s, env, i, T, samples, masks, seed, cc, cfg, dev, real_cache
             front=bool(real["front"][pi].any()), side=bool(real["side"][pi].any()),
             rear=bool(real["rear"][pi].any()), min_gap=float(real["gap"][pi].min()),
             progress=float(cm["progress"][pi]), acc2=float((acc[pi] ** 2).sum()),
-            jerk2=float((da[pi] ** 2).sum()), acc_prev=raw_prev))
+            jerk2=float((da[pi] ** 2).sum()), acc_prev=raw_prev,
+            n_delayed=len(real["delayed"][pi][-1]) if real.get("delayed") and real["delayed"][pi] else 0))
     return rows, {"paths": paths, "green": out["green"], "real": real}
 
 
@@ -182,6 +203,8 @@ def main():
     p.add_argument("--warp_ref", choices=["coast", "mix"], default=None,
                    help="predict-then-warp baseline: roll out only the reference plan(s), warp to every plan; runs are "
                         "named <run>_warp<ref>, csv gets the same suffix")
+    p.add_argument("--reactive", action="store_true",
+                   help="real futures with reactive road users (ReplayEnv(reactive=True)); runs and csv get _react")
     p.add_argument("--csv", default=None, help="skip the rollouts and only report from this plan_rank.csv")
     a = p.parse_args()
     cfg, cc = Config(), CostConfig()
@@ -195,10 +218,11 @@ def main():
         s = torch.load(path, map_location=dev)
         m = WorldModel(WMConfig(**s["wm_cfg"])).to(dev).eval()
         m.load_state_dict(s["model"])
-        run = os.path.basename(os.path.dirname(os.path.abspath(path))) + (f"_warp{a.warp_ref}" if a.warp_ref else "")
+        run = os.path.basename(os.path.dirname(os.path.abspath(path))) + (f"_warp{a.warp_ref}" if a.warp_ref else "") \
+            + ("_react" if a.reactive else "")
         key = json.dumps(s["stats"], sort_keys=True)
         if key not in envs:
-            envs[key] = ReplayEnv(a.cache, a.data_dir, split, cfg, s["stats"], horizon=T)
+            envs[key] = ReplayEnv(a.cache, a.data_dir, split, cfg, s["stats"], horizon=T, reactive=a.reactive)
         env = envs[key]
         idx = np.sort(np.random.default_rng(a.seed).choice(len(env.ds), min(a.n_windows, len(env.ds)),
                                                            replace=False))
@@ -210,7 +234,8 @@ def main():
                 print(f"  {run}: {j + 1}/{len(idx)} windows", end="\r")
         print()
     df = pd.DataFrame(rows)
-    out = os.path.join(os.path.dirname(os.path.abspath(a.ckpts[0])), "plan_rank" + (f"_warp{a.warp_ref}" if a.warp_ref else "") + ".csv")
+    out = os.path.join(os.path.dirname(os.path.abspath(a.ckpts[0])), "plan_rank" + (f"_warp{a.warp_ref}" if a.warp_ref else "")
+                       + ("_react" if a.reactive else "") + ".csv")
     df.to_csv(out, index=False)
     report(df, cc, a.contested)
     print(f"\nwrote {out}")
