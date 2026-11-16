@@ -174,6 +174,8 @@ def main():
     p.add_argument("--min_mass", type=float, default=0.3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--csv", default=None, help="only report from this action_gain.csv")
+    p.add_argument("--warp_ref", choices=["coast", "mix"], default=None,
+                   help="predict-then-warp baseline (runs <run>_warp<ref>, action_gain_warp<ref>.csv)")
     p.add_argument("--z_mean", action="store_true",
                    help="z = the prior mean instead of samples (is the leak in the prior head or in the deterministic "
                         "path?); runs are named <run>_zmean, written to action_gain_zmean.csv")
@@ -192,7 +194,7 @@ def main():
         m = WorldModel(WMConfig(**s["wm_cfg"])).to(dev).eval()
         m.load_state_dict(s["model"])
         run = os.path.basename(os.path.dirname(os.path.abspath(path))) + (f"_sanity_{a.sanity}" if a.sanity else "") \
-            + ("_zmean" if a.z_mean else "")
+            + ("_zmean" if a.z_mean else "") + (f"_warp{a.warp_ref}" if a.warp_ref else "")
         key = json.dumps(s["stats"], sort_keys=True)
         if key not in envs:
             envs[key] = ReplayEnv(a.cache, a.data_dir, split, cfg, s["stats"], horizon=10)
@@ -201,7 +203,7 @@ def main():
                                                            replace=False))
         for j, i in enumerate(idx):
             r = score_window(m, s, env, int(i), 10, a.samples, a.masks, a.seed, cc, cfg, dev, real_cache, run,
-                             z_mode="mean" if a.z_mean else "sample")
+                             z_mode="mean" if a.z_mean else "sample", warp_ref=a.warp_ref)
             if r is not None:
                 rows.extend(dict(run=run, **c) for c in cases(env, r[1], cfg.render, a.min_shift, a.min_mass,
                                                                     a.sanity))
@@ -209,7 +211,8 @@ def main():
                 print(f"  {run}: {j + 1}/{len(idx)} windows", end="\r")
         print()
     df = pd.DataFrame(rows)
-    name = (f"action_gain_sanity_{a.sanity}" if a.sanity else "action_gain") + ("_zmean" if a.z_mean else "") + ".csv"
+    name = (f"action_gain_sanity_{a.sanity}" if a.sanity else "action_gain") + ("_zmean" if a.z_mean else "") \
+        + (f"_warp{a.warp_ref}" if a.warp_ref else "") + ".csv"
     out = os.path.join(os.path.dirname(os.path.abspath(a.ckpts[0])), name)
     df.to_csv(out, index=False)
     report(df)

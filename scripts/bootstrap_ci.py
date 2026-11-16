@@ -91,18 +91,18 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cache", required=True)
     p.add_argument("--split", default="val")
-    p.add_argument("--gain", default=None)
-    p.add_argument("--plan_rank", default=None)
+    p.add_argument("--gain", nargs="+", default=None, help="one or more action_gain csv files (concatenated)")
+    p.add_argument("--plan_rank", nargs="+", default=None, help="one or more plan_rank csv files (concatenated)")
     p.add_argument("--contested", type=float, default=0.5)
     p.add_argument("--boot", type=int, default=1000)
     a = p.parse_args()
     rec_of = window_recordings(a.cache, a.split, Config())
     if a.gain:
-        g = pd.read_csv(a.gain)
+        g = pd.concat([pd.read_csv(f) for f in a.gain], ignore_index=True)
         g = g.assign(rec=rec_of[g.window.to_numpy()], run=g.run if "run" in g else "model")
         gain_table(g, a.boot)
     if a.plan_rank:
-        pr = pd.read_csv(a.plan_rank)
+        pr = pd.concat([pd.read_csv(f) for f in a.plan_rank], ignore_index=True)
         pr = pr.assign(rec=rec_of[pr.window.to_numpy()], run=pr.run if "run" in pr else "model")
         plan_table(pr, CostConfig(), a.contested, a.boot)
 
