@@ -65,16 +65,51 @@ class StubDino(nn.Module):
         return {"x_norm_patchtokens": self.norm(self.proj(x).flatten(2).transpose(1, 2))}
 
 
+HF_NAMES = {"dinov2_vits14": "facebook/dinov2-small", "dinov2_vitb14": "facebook/dinov2-base",
+            "dinov2_vits14_reg": "facebook/dinov2-with-registers-small",
+            "dinov2_vitb14_reg": "facebook/dinov2-with-registers-base"}
+
+
+class HFDino(nn.Module):
+    """A Hugging Face transformers DINOv2 with DINOv2's own interface: forward_features(x)["x_norm_patchtokens"].
+    last_hidden_state is already layer-normed (Dinov2Model applies its final LayerNorm), as x_norm_patchtokens is;
+    the CLS token (and register tokens) are dropped. Position embeddings are interpolated to the input size."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.n_prefix = 1 + int(getattr(model.config, "num_register_tokens", 0) or 0)
+
+    def forward_features(self, x):
+        out = self.model(pixel_values=x).last_hidden_state
+        return {"x_norm_patchtokens": out[:, self.n_prefix:]}
+
+
 def load_dino(name: str) -> nn.Module:
+    """Frozen DINOv2. First choice: Hugging Face transformers (works on Python 3.9; the facebookresearch/dinov2
+    torch.hub code now needs Python >= 3.10). Tries the local cache first (compute nodes have no internet)."""
     if name == "stub":
         torch.manual_seed(0)
         return StubDino(DINO_DIMS["stub"])
+    errors = []
+    if name in HF_NAMES:
+        try:
+            from transformers import AutoModel
+            try:
+                m = AutoModel.from_pretrained(HF_NAMES[name], local_files_only=True)
+            except Exception:  # noqa: BLE001 - not cached yet: download (login node)
+                m = AutoModel.from_pretrained(HF_NAMES[name])
+            return HFDino(m)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"transformers: {e}")
     try:
         return torch.hub.load("facebookresearch/dinov2", name, trust_repo=True)
-    except Exception as e:  # noqa: BLE001 - say how to fix it, then re-raise
-        raise RuntimeError(
-            f"could not load {name} via torch.hub ({e}). Compute nodes usually have no internet: run once on a login "
-            f"node: python -c \"import torch; torch.hub.load('facebookresearch/dinov2', '{name}', trust_repo=True)\"")
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"torch.hub: {e}")
+    raise RuntimeError(
+        f"could not load {name}: {' | '.join(errors)}. Compute nodes have no internet: run once on a login node: "
+        f"pip install 'transformers<5' && python -c \"from transformers import AutoModel; "
+        f"AutoModel.from_pretrained('{HF_NAMES.get(name, name)}')\"")
 
 
 class FrozenDino(nn.Module):
