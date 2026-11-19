@@ -16,6 +16,14 @@ Action-invariance loss (fix B for lead mirroring; roundabout_wm/invariance.py), 
 Two extra 2 s rollouts per step (human vs counterfactual acceleration, z = prior mean); logs inv (the penalty),
 inv_area (share of pixels in the region) and inv_shift (mean ego displacement between the plans at the end, m).
 
+DINO-WM-style model (roundabout_wm/models/dino_wm.py): frozen pretrained DINOv2 encoder, ViT predictor over the last
+4 frames (no GRU), optional per-step latent. Once, on a LOGIN node (compute nodes have no internet):
+    python -c "import torch; torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', trust_repo=True)"
+    python scripts/train_wm.py --cache $C --arch dino --deterministic --run dino_det --n_pred 10
+    python scripts/train_wm.py --cache $C --arch dino --run dino_z --n_pred 10 --beta 1e-4 --anchor_prior 1e-6 \
+        --kl_warmup_steps 2000
+(the latent run trains from scratch: one change against dino_det, the latent)
+
 Rerunning the same command resumes from runs/<run>/last.pt (written every --ckpt_minutes), which is what makes
 #SBATCH --requeue and the Cloud Bursting idle shutdown survivable.
 
@@ -74,6 +82,18 @@ def args_():
     p.add_argument("--run", required=True, help="run name; outputs in <runs_dir>/<run>")
     p.add_argument("--runs_dir", default="runs")
     p.add_argument("--encoder", default="cnn", choices=["cnn", "vit"])
+    p.add_argument("--arch", default="gru", choices=["gru", "dino"],
+                   help="gru: the ConvGRU model; dino: frozen DINOv2 + ViT predictor over the last --hist frames")
+    p.add_argument("--dino", default="dinov2_vits14", help="frozen backbone for --arch dino (torch.hub name)")
+    p.add_argument("--hist", type=int, default=4, help="--arch dino: frames the predictor attends over")
+    p.add_argument("--pred_depth", type=int, default=6)
+    p.add_argument("--pred_width", type=int, default=384)
+    p.add_argument("--pred_heads", type=int, default=6)
+    p.add_argument("--teacher_forcing", action=argparse.BooleanOptionalAction, default=True,
+                   help="--arch dino: train on true history (DINO-WM); --no-teacher_forcing rolls out on predictions")
+    p.add_argument("--pix_weight", type=float, default=0.0,
+                   help="--arch dino: weight of the pixel loss on predicted frames (0 = decoder trained on true "
+                        "features only, as DINO-WM)")
     p.add_argument("--init_encoder", default=None, help="MAE-pretrained encoder weights (vit only)")
     p.add_argument("--deterministic", action="store_true",
                    help="stage 1: no z, no prior/posterior, no KL (the model learns the conditional mean)")
@@ -309,7 +329,7 @@ def gpu_util():
         return ""
 
 
-LOG_FIELDS = (["step", "split", "beta", "loss", "mse", "mse_warm", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar",
+LOG_FIELDS = (["step", "split", "beta", "loss", "mse", "mse_warm", "feat", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar",
                "mean_gap", "post_mu_abs", "prior_mu_abs", "post_mu_spread", "act_sens", "gap_mean", "s_per_step",
                "gpu_util", "time", "elbo", "inv", "inv_area", "inv_shift", "inv_mass_h", "inv_mass_c"]
               + [f"{m}@{k}" for k in REPORT_STEPS for m in ("prior", "post", "empty", "copy", "warp", "mass", "kl",
@@ -391,7 +411,12 @@ def main():
                       p_zdrop=a.p_zdrop, beta=a.beta, prior_sg=a.prior_sg, deterministic=a.deterministic,
                       p_openloop=a.p_openloop, residual=a.residual, reencode=a.reencode,
                       anchor_prior=a.anchor_prior, z_global=a.z_global, best_of=a.best_of,
-                      fixed_prior=a.fixed_prior, z_seq=a.z_seq)
+                      fixed_prior=a.fixed_prior, z_seq=a.z_seq, arch=a.arch, dino=a.dino, hist=a.hist,
+                      pred_width=a.pred_width, pred_depth=a.pred_depth, pred_heads=a.pred_heads,
+                      teacher_forcing=a.teacher_forcing, pix_weight=a.pix_weight)
+    if a.arch == "dino":
+        from roundabout_wm.models.dino_wm import hidden_size
+        wm_cfg.hidden = hidden_size(a.dino, a.hist)
     model = WorldModel(wm_cfg).to(dev)
     enc_params = list(model.encoder.parameters())
     enc_ids = {id(p) for p in enc_params}
@@ -452,7 +477,7 @@ def main():
     if dev == "cuda":
         print(f"GPU {torch.cuda.get_device_name()} | {'bf16 autocast' if use_amp else 'fp32 (no native bf16)'}")
     keys = ("loss", "mse", "mse_warm", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar", "mean_gap", "post_mu_abs",
-            "prior_mu_abs", "post_mu_spread") + (("inv", "inv_area", "inv_shift", "inv_mass_h", "inv_mass_c")
+            "prior_mu_abs", "post_mu_spread") + (("feat",) if a.arch == "dino" else ()) + (("inv", "inv_area", "inv_shift", "inv_mass_h", "inv_mass_c")
                                                   if a.inv_weight > 0 else ())
     inv_consts = tuple(float(x) for x in a.inv_consts.split(","))
     last_ckpt, t0 = time.time(), time.time()
@@ -488,6 +513,7 @@ def main():
                 print(f"step {step} | beta {beta_at(step, a):.1e} | loss {m['loss']:.5f} mse {m['mse']:.5f} warm {m['mse_warm']:.5f} "
                       f"kl {m['kl']:.1f} prior_std {m['prior_std']:.3f} | logvar post {m['post_logvar']:.2f} "
                       f"prior {m['prior_logvar']:.2f} | {sps:.3f} s/step gpu {gu}%"
+                      + (f" | feat {m['feat']:.4f}" if a.arch == "dino" else "")
                       + (f" | inv {m['inv']:.5f} area {m['inv_area']:.3f} shift {m['inv_shift']:.1f} m"
                          f" mass {m['inv_mass_h']:.2f}/{m['inv_mass_c']:.2f}"
                          if a.inv_weight > 0 else ""))
