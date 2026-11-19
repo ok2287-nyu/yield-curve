@@ -141,3 +141,16 @@ def test_train_and_action_gain_end_to_end():
                         "--data_dir", raw, "--ckpts", ck, "--split", "val", "--n_windows", "20", "--samples", "1",
                         "--masks", "1"], capture_output=True, text=True, cwd=root, env=env)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+
+
+def test_hf_wrapper_gives_the_8x8_grid():
+    """The transformers path: a small random Dinov2Model (no download) through HFDino + FrozenDino's resize."""
+    import pytest
+    tr = pytest.importorskip("transformers")
+    from roundabout_wm.models.dino_wm import FrozenDino, HFDino
+    cfg = tr.Dinov2Config(hidden_size=384, num_hidden_layers=2, num_attention_heads=6, intermediate_size=512,
+                          patch_size=14, image_size=518)
+    enc = FrozenDino("stub")
+    enc.net = HFDino(tr.Dinov2Model(cfg)).eval()
+    y = enc(torch.rand(3, 3, 64, 64))
+    assert y.shape == (3, 384, 8, 8) and torch.isfinite(y).all()

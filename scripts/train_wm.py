@@ -18,7 +18,8 @@ inv_area (share of pixels in the region) and inv_shift (mean ego displacement be
 
 DINO-WM-style model (roundabout_wm/models/dino_wm.py): frozen pretrained DINOv2 encoder, ViT predictor over the last
 4 frames (no GRU), optional per-step latent. Once, on a LOGIN node (compute nodes have no internet):
-    python -c "import torch; torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', trust_repo=True)"
+    pip install 'transformers<5'
+    python -c "from transformers import AutoModel; AutoModel.from_pretrained('facebook/dinov2-small')"
     python scripts/train_wm.py --cache $C --arch dino --deterministic --run dino_det --n_pred 10
     python scripts/train_wm.py --cache $C --arch dino --run dino_z --n_pred 10 --beta 1e-4 --anchor_prior 1e-6 \
         --kl_warmup_steps 2000
