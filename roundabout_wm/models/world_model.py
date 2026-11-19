@@ -87,6 +87,15 @@ class WMConfig:
                                 # --p_openloop then means: this share of sequences uses a prior sample instead
     logvar_min: float = -8.0
     logvar_max: float = 6.0
+    # ---- arch="dino": DINO-WM-style model (models/dino_wm.py); the fields below are unused by arch="gru" ----------
+    arch: str = "gru"           # "gru" = this file's ConvGRU model; "dino" = frozen DINOv2 + ViT predictor, no GRU
+    dino: str = "dinov2_vits14"  # frozen backbone ("stub" = random frozen patch embedding, for tests)
+    hist: int = 4               # frames the predictor attends over (0.8 s)
+    pred_width: int = 384
+    pred_depth: int = 6
+    pred_heads: int = 6
+    teacher_forcing: bool = True  # training: the buffer gets the TRUE next features after each step (DINO-WM)
+    pix_weight: float = 0.0     # weight of the pixel loss on PREDICTED frames (gradient into the predictor)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -192,6 +201,12 @@ def gauss_kl(mu_q, lv_q, mu_p, lv_p):
 
 # ---------------------------------------------------------------------------------------------------------------
 class WorldModel(nn.Module):
+    def __new__(cls, cfg: WMConfig = None, *args, **kw):
+        if cfg is not None and getattr(cfg, "arch", "gru") == "dino":       # every script builds WorldModel(cfg)
+            from .dino_wm import DinoWM
+            return DinoWM(cfg)
+        return super().__new__(cls)
+
     def __init__(self, cfg: WMConfig):
         super().__init__()
         self.cfg = cfg
@@ -493,6 +508,8 @@ class WorldModel(nn.Module):
 
 def param_counts(model: WorldModel) -> dict:
     count = lambda m: sum(p.numel() for p in m.parameters())
-    parts = {k: count(getattr(model, k)) for k in ("encoder", "P_e", "P_z", "A", "pred", "prior", "posterior", "dec")}
+    parts = {k: count(getattr(model, k)) for k in ("encoder", "P_e", "P_z", "A", "embed", "pred", "head", "prior",
+                                                    "posterior", "dec") if hasattr(model, k)}
+    parts["trainable"] = sum(p.numel() for p in model.parameters() if p.requires_grad)
     parts["total"] = count(model)
     return parts
