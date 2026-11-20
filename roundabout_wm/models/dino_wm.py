@@ -44,13 +44,21 @@ DINO_DIMS = {"dinov2_vits14": 384, "dinov2_vits14_reg": 384, "dinov2_vitb14": 76
              "stub": 384}
 
 
-def feat_dim(name: str) -> int:
-    return DINO_DIMS[name]
+def fold(size: int) -> int:
+    """Input size 112 -> 8x8 patches (fold 1); 224 -> 16x16 patches, each 2x2 block stacked into one cell (fold 2)."""
+    if size % 112:
+        raise ValueError(f"dino_size must be a multiple of 112, got {size}")
+    return size // 112
 
 
-def hidden_size(name: str, hist: int) -> int:
+def feat_dim(name: str, size: int = 112) -> int:
+    """Channels per 8x8 cell: the backbone's width x fold^2 (224 px: 4 patches of 4 raster px stacked)."""
+    return DINO_DIMS[name] * fold(size) ** 2
+
+
+def hidden_size(name: str, hist: int, size: int = 112) -> int:
     """Channels of the state h: K frames x (D features + acc, curv, v)."""
-    return hist * (feat_dim(name) + 3)
+    return hist * (feat_dim(name, size) + 3)
 
 
 class StubDino(nn.Module):
@@ -112,14 +120,29 @@ def load_dino(name: str) -> nn.Module:
         f"AutoModel.from_pretrained('{HF_NAMES.get(name, name)}')\"")
 
 
-class FrozenDino(nn.Module):
-    """(B, 3, 64, 64) in [0, 1] -> (B, D, 8, 8). Frozen, always in eval mode, no gradients."""
+def last_blocks(net: nn.Module, n: int):
+    """The last n transformer blocks and the final norm of a DINOv2 (transformers, torch.hub or the stub)."""
+    if isinstance(net, HFDino):
+        return list(net.model.encoder.layer[-n:]) + [net.model.layernorm]
+    if hasattr(net, "blocks"):
+        return list(net.blocks[-n:]) + [net.norm]
+    return [net]                                             # stub: all of it
 
-    def __init__(self, name: str, size: int = 112):
+
+class FrozenDino(nn.Module):
+    """(B, 3, 64, 64) in [0, 1] -> (B, D * fold^2, 8, 8). Frozen and without gradients, except for the last `ft`
+    blocks when ft > 0 (fine-tuning). Always in eval mode (DINOv2 has no dropout; keeps it deterministic)."""
+
+    def __init__(self, name: str, size: int = 112, ft: int = 0):
         super().__init__()
-        self.net, self.size = load_dino(name), size
+        self.net, self.size, self.ft = load_dino(name), size, ft
+        self.k = fold(size)
         for p in self.net.parameters():
             p.requires_grad_(False)
+        if ft > 0:
+            for m in last_blocks(self.net, ft):
+                for p in m.parameters():
+                    p.requires_grad_(True)
         self.net.eval()
         self.register_buffer("mean", torch.tensor(IMNET_MEAN).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("std", torch.tensor(IMNET_STD).view(1, 3, 1, 1), persistent=False)
@@ -129,12 +152,13 @@ class FrozenDino(nn.Module):
         self.net.eval()
         return self
 
-    @torch.no_grad()
     def forward(self, x):
-        x = F.interpolate(x.float(), size=(self.size, self.size), mode="bilinear", align_corners=False)
-        t = self.net.forward_features((x - self.mean) / self.std)["x_norm_patchtokens"]      # (B, 64, D)
-        g = int(math.isqrt(t.shape[1]))
-        return t.float().transpose(1, 2).reshape(x.shape[0], -1, g, g)
+        with torch.set_grad_enabled(self.ft > 0 and torch.is_grad_enabled()):
+            x = F.interpolate(x.float(), size=(self.size, self.size), mode="bilinear", align_corners=False)
+            t = self.net.forward_features((x - self.mean) / self.std)["x_norm_patchtokens"]      # (B, g*g, D)
+            g = int(math.isqrt(t.shape[1]))
+            f = t.float().transpose(1, 2).reshape(x.shape[0], -1, g, g)
+            return F.pixel_unshuffle(f, self.k) if self.k > 1 else f                         # -> (B, D k^2, 8, 8)
 
 
 class DinoWM(nn.Module):
@@ -142,12 +166,15 @@ class DinoWM(nn.Module):
         super().__init__()
         from .world_model import GaussHead, StickyDropout2d   # same building blocks as the old model
         self.cfg = cfg
-        K, D, W, Z, p = cfg.hist, feat_dim(cfg.dino), cfg.pred_width, cfg.z_ch, cfg.dropout
-        if cfg.hidden != hidden_size(cfg.dino, K):      # the state's channel count (imagine() reads cfg.hidden)
+        K, D, W, Z, p = cfg.hist, feat_dim(cfg.dino, cfg.dino_size), cfg.pred_width, cfg.z_ch, cfg.dropout
+        if cfg.dino_ft > 0 and cfg.feat_weight > 0:
+            raise ValueError("fine-tuning DINO (dino_ft > 0) with a feature loss lets encoder and predictor agree on "
+                             "constant features (collapse): use feat_weight 0 and pix_weight > 0")
+        if cfg.hidden != hidden_size(cfg.dino, K, cfg.dino_size):   # the state's channels (imagine() reads it)
             import dataclasses
-            cfg = self.cfg = dataclasses.replace(cfg, hidden=hidden_size(cfg.dino, K))
+            cfg = self.cfg = dataclasses.replace(cfg, hidden=hidden_size(cfg.dino, K, cfg.dino_size))
         self.K, self.D = K, D
-        self.encoder = FrozenDino(cfg.dino)
+        self.encoder = FrozenDino(cfg.dino, cfg.dino_size, cfg.dino_ft)
         self.embed = nn.Linear(D + 3, W)
         self.pos_space = nn.Parameter(torch.zeros(1, 1, 64, W))
         self.pos_time = nn.Parameter(torch.zeros(1, K, 1, W))
@@ -324,7 +351,7 @@ class DinoWM(nn.Module):
         mse_warm = ((out["green_warm"].float() - imgs[:, :n, GREEN:GREEN + 1]) ** 2).mean()
         kl = out["kl"].mean() if out["kl"] is not None else torch.zeros((), device=feat.device)
         anchor = out["kl_anchor"].mean() if out["kl_anchor"] is not None else torch.zeros((), device=feat.device)
-        loss = (feat + mse_warm + cfg.pix_weight * mse_t.mean() + (cfg.beta if beta is None else beta) * kl
+        loss = (cfg.feat_weight * feat + mse_warm + cfg.pix_weight * mse_t.mean() + (cfg.beta if beta is None else beta) * kl
                 + cfg.anchor_prior * anchor)
         ls = out["latent_stats"]
         names = ("post_logvar", "prior_logvar", "mean_gap", "post_mu_abs", "prior_mu_abs", "post_mu_spread")

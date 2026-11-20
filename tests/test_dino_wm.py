@@ -154,3 +154,26 @@ def test_hf_wrapper_gives_the_8x8_grid():
     enc.net = HFDino(tr.Dinov2Model(cfg)).eval()
     y = enc(torch.rand(3, 3, 64, 64))
     assert y.shape == (3, 384, 8, 8) and torch.isfinite(y).all()
+
+
+def test_224_input_folds_into_the_8x8_grid():
+    m = WorldModel(WMConfig(n_cond=N, arch="dino", dino="stub", dino_size=224, deterministic=True))
+    assert m.D == 4 * 384 and m.cfg.hidden == hidden_size("stub", 4, 224)
+    b = _batch()
+    loss, _ = m.loss(b, P)
+    loss.backward()
+    assert m.encode(b["images"][:, :2]).shape == (B, 2, 1536, 8, 8)
+
+
+def test_finetuning_trains_the_encoder_and_refuses_the_feature_loss():
+    import pytest
+    with pytest.raises(ValueError):
+        WorldModel(WMConfig(n_cond=N, arch="dino", dino="stub", dino_ft=2))
+    m = WorldModel(WMConfig(n_cond=N, arch="dino", dino="stub", dino_ft=2, feat_weight=0.0, pix_weight=1.0,
+                            deterministic=True))
+    loss, logs = m.loss(_batch(), P)
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.encoder.parameters())
+    m.eval()
+    with torch.no_grad():                                  # eval / planning: no graph
+        assert not m.encode(_batch()["images"][:, :2]).requires_grad
