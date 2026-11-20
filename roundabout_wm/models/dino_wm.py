@@ -97,8 +97,9 @@ def load_dino(name: str) -> nn.Module:
     """Frozen DINOv2. First choice: Hugging Face transformers (works on Python 3.9; the facebookresearch/dinov2
     torch.hub code now needs Python >= 3.10). Tries the local cache first (compute nodes have no internet)."""
     if name == "stub":
-        torch.manual_seed(0)
-        return StubDino(DINO_DIMS["stub"])
+        with torch.random.fork_rng(devices=[]):          # fixed weights without touching the caller's RNG state
+            torch.manual_seed(0)
+            return StubDino(DINO_DIMS["stub"])
     errors = []
     if name in HF_NAMES:
         try:

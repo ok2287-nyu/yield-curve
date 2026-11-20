@@ -15,6 +15,13 @@ is marked "HIT". Red = road, blue = ego, green = other road users.
     real | <plan>     the logged road users seen from where the plan takes the ego (replay: nobody reacts)
 In both rows the car that is hit is outlined in yellow at its TRUE position, so in the model row you can see
 whether the model puts it there, somewhere else, or nowhere.
+
+--clip also writes an animation per case (GIF + MP4, for slides): three panels side by side,
+    imagination      what the model predicts under the plan (--clip_view mean: the average the planner scores;
+                     sample: one prior sample, sharper)
+    reality          the same plan in the replay (nobody reacts); red frame from the first collision on
+    the human        what the human really did (log)
+the hit car outlined in yellow in the first two. One frame per 0.2 s step, shown --clip_ms each, last frame held.
 """
 import argparse
 import json
@@ -60,6 +67,42 @@ def pick(exploit, gain, run, unexplained):
     return [(int(r.window), r.plan, int(r.track), float(r.t_hit)) for r in e.itertuples()]
 
 
+def clip(stem, first, imag, real, human, plan, k_hit, dt, ms, scale):
+    """first (1, 3, H, W); imag / real / human (K, 3, H, W) in [0, 1] -> stem.gif and stem.mp4."""
+    from PIL import Image
+    titles = (f"imagination: model | {plan}", f"reality: replay | {plan}", "what the human did")
+    W = 64 * scale
+    pad, head, foot = 8, 26, 30
+    frames = []
+    K = imag.shape[0]
+    for j in range(K + 1):                                                 # j = 0: the last observed frame
+        panels = [first[0]] * 3 if j == 0 else [imag[j - 1], real[j - 1], human[j - 1]]
+        canvas = Image.new("RGB", (3 * W + 4 * pad, W + head + foot), (18, 18, 18))
+        d = ImageDraw.Draw(canvas)
+        for i, (pnl, ttl) in enumerate(zip(panels, titles)):
+            arr = (pnl.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            im = Image.fromarray(arr).resize((W, W), Image.NEAREST)
+            x = pad + i * (W + pad)
+            canvas.paste(im, (x, head))
+            d.text((x, 6), ttl, fill=(230, 230, 230))
+            if i == 1 and k_hit is not None and j >= 1 and j - 1 >= k_hit:
+                d.rectangle([x - 2, head - 2, x + W + 1, head + W + 1], outline=(255, 50, 50), width=3)
+                d.text((x + W - 34, head + 4), "HIT", fill=(255, 70, 70))
+        t = j * dt
+        d.text((pad, head + W + 8), f"t = +{t:.1f} s   yellow = the car that gets hit, where it really is",
+               fill=(200, 200, 200))
+        frames.append(canvas)
+    durations = [ms] * len(frames)
+    durations[0], durations[-1] = 2 * ms, 5 * ms                           # pause on the start and the end
+    frames[0].save(stem + ".gif", save_all=True, append_images=frames[1:], duration=durations, loop=0)
+    fps = 1000.0 / ms
+    vw = cv2.VideoWriter(stem + ".mp4", cv2.VideoWriter_fourcc(*"mp4v"), fps, frames[0].size)
+    for f, dur in zip(frames, durations):
+        for _ in range(max(1, round(dur / ms))):
+            vw.write(cv2.cvtColor(np.asarray(f), cv2.COLOR_RGB2BGR))
+    vw.release()
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cache", required=True)
@@ -73,6 +116,10 @@ def main():
     p.add_argument("--masks", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out_dir", default="runs/crash_sheets")
+    p.add_argument("--clip", action="store_true", help="also write imagination | reality | human animations")
+    p.add_argument("--clip_view", choices=["mean", "sample"], default="mean")
+    p.add_argument("--clip_ms", type=int, default=400, help="ms per 0.2 s step")
+    p.add_argument("--clip_scale", type=int, default=5, help="pixel upscale of the 64x64 frames")
     a = p.parse_args()
     cfg, cc = Config(), CostConfig()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -127,6 +174,21 @@ def main():
             d.text((x0 + cell - 30, 2), "HIT", fill=(255, 80, 80))
         out = os.path.join(a.out_dir, f"crash_{run}_w{w}_{plan}.png")
         grid.save(out)
+        if a.clip:
+            if a.clip_view == "sample":                                  # one prior sample, one dropout mask
+                Gs = ctx["green"].float()[0, 0][pi][steps].cpu()
+                imag = compose(Gs[:, None], real[:, :1], real[:, 2:3])
+                for j, k in enumerate(steps):
+                    o = torch.from_numpy(outline(env.footprint(tid, poses[pi, k + 1], k + 1)))
+                    imag[j, 0][o], imag[j, 1][o], imag[j, 2][o] = 1.0, 1.0, 0.0
+            else:
+                imag = model
+            human = torch.stack([torch.from_numpy(env.render(tuple(poses[0, k + 1]), k + 1)).float() / 255
+                                 for k in steps])
+            humc = compose(human[:, 1:2], human[:, :1], human[:, 2:3])
+            k_hit = int(round(t_hit / cfg.data.dt)) - 1 if t_hit is not None else None
+            clip(os.path.join(a.out_dir, f"clip_{run}_w{w}_{plan}"), first, imag, realc, humc, plan, k_hit,
+                 cfg.data.dt, a.clip_ms, a.clip_scale)
         print(f"window {w} {plan}, hit track {tid} at {t_hit} s -> {out}")
 
 

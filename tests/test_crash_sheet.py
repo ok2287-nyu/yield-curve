@@ -30,3 +30,15 @@ def test_crash_sheet_smoke():
              "--samples", "1", "--masks", "1", "--out_dir", out)
     assert sorted(f for f in os.listdir(out) if f.endswith(".png")) == ["crash_fake_w0_brake.png",
                                                                         "crash_fake_w0_go.png"]
+
+
+def test_crash_clip_writes_gif_and_mp4():
+    from PIL import Image
+    S = tag._setup()
+    out = os.path.join(S["root"], "clip")
+    tag._run("crash_sheet.py", "--ckpt", S["ck"], "--cases", "0:go:2", "--samples", "1", "--masks", "1",
+             "--out_dir", out, "--clip", "--clip_view", "sample")
+    gif = os.path.join(out, "clip_fake_w0_go.gif")
+    assert os.path.exists(gif) and os.path.getsize(os.path.join(out, "clip_fake_w0_go.mp4")) > 0
+    im = Image.open(gif)
+    assert im.n_frames == 11                       # the observed frame + 10 steps
