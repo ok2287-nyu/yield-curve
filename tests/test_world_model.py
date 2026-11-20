@@ -274,12 +274,14 @@ def _masks_drawn_per_module(per_sequence):
     seen = {}
     mods = [d for d in m.modules() if isinstance(d, StickyDropout2d)]
     orig = StickyDropout2d.forward
+    calls = iter(range(10 ** 9))
 
     def spy(self, x):
         y = orig(self, x)
         if self.training and self.p > 0:
-            key = id(self.mask) if self.sticky else object()      # non-sticky: a fresh mask every call
-            seen.setdefault(id(self), set()).add(key if self.sticky else id(key))
+            # sticky: the mask tensor's identity (kept alive by the module); non-sticky: a fresh mask every call, so a
+            # unique counter (not id(object()): CPython reuses the address of a freed object, which made this flaky)
+            seen.setdefault(id(self), set()).add(id(self.mask) if self.sticky else next(calls))
         return y
     StickyDropout2d.forward = spy
     try:
