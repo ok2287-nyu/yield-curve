@@ -96,6 +96,9 @@ class WMConfig:
     pred_heads: int = 6
     teacher_forcing: bool = True  # training: the buffer gets the TRUE next features after each step (DINO-WM)
     pix_weight: float = 0.0     # weight of the pixel loss on PREDICTED frames (gradient into the predictor)
+    feat_weight: float = 1.0    # weight of the feature-prediction loss (0 when fine-tuning DINO)
+    dino_size: int = 112        # DINO input size: 112 -> 8x8 patches; 224 -> 16x16, each 2x2 block stacked per cell
+    dino_ft: int = 0            # fine-tune DINO's last N blocks (0 = frozen); needs feat_weight 0
 
 
 # ---------------------------------------------------------------------------------------------------------------

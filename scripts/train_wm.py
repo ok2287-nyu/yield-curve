@@ -92,6 +92,12 @@ def args_():
     p.add_argument("--pred_heads", type=int, default=6)
     p.add_argument("--teacher_forcing", action=argparse.BooleanOptionalAction, default=True,
                    help="--arch dino: train on true history (DINO-WM); --no-teacher_forcing rolls out on predictions")
+    p.add_argument("--dino_size", type=int, default=112,
+                   help="--arch dino: input size; 224 = 16x16 patches of 4 raster px, stacked 2x2 into the 8x8 grid")
+    p.add_argument("--dino_ft", type=int, default=0,
+                   help="--arch dino: fine-tune DINO's last N blocks (needs --feat_weight 0 --pix_weight > 0); "
+                        "encoder lr x0.1 unless --enc_lr_mult is given")
+    p.add_argument("--feat_weight", type=float, default=1.0, help="--arch dino: weight of the feature loss")
     p.add_argument("--pix_weight", type=float, default=0.0,
                    help="--arch dino: weight of the pixel loss on predicted frames (0 = decoder trained on true "
                         "features only, as DINO-WM)")
@@ -169,7 +175,7 @@ def args_():
     p.add_argument("--wandb_entity", default=os.environ.get("WANDB_ENTITY"), help="W&B team/user; shared team = one place")
     a = p.parse_args()
     if a.enc_lr_mult is None:
-        a.enc_lr_mult = 0.1 if a.init_encoder else 1.0
+        a.enc_lr_mult = 0.1 if (a.init_encoder or (a.arch == "dino" and a.dino_ft > 0)) else 1.0
     if a.deterministic and a.init_from:
         p.error("--init_from is for the stochastic stage 2; drop --deterministic")
     if a.inv_weight > 0 and not a.inv_masks:
@@ -414,10 +420,11 @@ def main():
                       anchor_prior=a.anchor_prior, z_global=a.z_global, best_of=a.best_of,
                       fixed_prior=a.fixed_prior, z_seq=a.z_seq, arch=a.arch, dino=a.dino, hist=a.hist,
                       pred_width=a.pred_width, pred_depth=a.pred_depth, pred_heads=a.pred_heads,
-                      teacher_forcing=a.teacher_forcing, pix_weight=a.pix_weight)
+                      teacher_forcing=a.teacher_forcing, pix_weight=a.pix_weight, feat_weight=a.feat_weight,
+                      dino_size=a.dino_size, dino_ft=a.dino_ft)
     if a.arch == "dino":
         from roundabout_wm.models.dino_wm import hidden_size
-        wm_cfg.hidden = hidden_size(a.dino, a.hist)
+        wm_cfg.hidden = hidden_size(a.dino, a.hist, a.dino_size)
     model = WorldModel(wm_cfg).to(dev)
     enc_params = list(model.encoder.parameters())
     enc_ids = {id(p) for p in enc_params}
