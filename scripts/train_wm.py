@@ -164,6 +164,9 @@ def args_():
     p.add_argument("--inv_fwd", type=int, default=8, help="px the region grows along the ego's forward axis")
     p.add_argument("--inv_side", type=int, default=2, help="px the region grows sideways")
     p.add_argument("--inv_near", type=int, default=2, help="px around other road users left out of the region")
+    p.add_argument("--inv_target", choices=["rollout", "truth"], default="rollout",
+                   help="invariance loss reference: rollout = agree with the human rollout (v1-v3); truth = match the "
+                        "TRUE future on the cars that cannot react, z from the human rollout's posterior (v4)")
     p.add_argument("--inv_guard", type=float, default=0.0,
                    help="weight of the mass guard inside the invariance loss (0 = only logged): penalises missing car "
                         "on the true footprints of cars that cannot react, in both rollouts (with gradients)")
@@ -511,7 +514,7 @@ def main():
                     inv, inv_logs = invariance_loss(model, b, stats, cfg.render, cfg.data.dt, H=a.inv_steps,
                                                     consts=inv_consts, human_frac=a.inv_human_frac,
                                                     fwd=a.inv_fwd, side=a.inv_side, near=a.inv_near, z_mode=a.inv_z,
-                                                    guard=a.inv_guard)
+                                                    guard=a.inv_guard, target=a.inv_target)
                     loss = loss + a.inv_weight * inv
                     logs = logs | inv_logs | {"loss": loss.item()}
             if not torch.isfinite(loss):

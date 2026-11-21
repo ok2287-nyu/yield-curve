@@ -212,6 +212,35 @@ def region(nr, re, fwd=8, side=2, near=2):
 
 
 # ---- the loss --------------------------------------------------------------------------------------------------------
+def _abduct(model, h, actions, speeds, e_fut, n, H, prev):
+    """Counterfactual step 1 (abduction): the human rollout with POSTERIOR z (it sees the true next frames) -> the
+    z of each step, detached (the ELBO trains the posterior; this loss only uses what it infers), and the greens."""
+    zs, greens = [], []
+    for k in range(H):
+        i = n - 1 + k
+        if model.cfg.deterministic:
+            z = model.zero_z(h.shape[0], h.device)
+        else:
+            mu, lv = model.posterior(torch.cat([h, e_fut[:, k]], 1))
+            z = (mu + (0.5 * lv).exp() * torch.randn_like(mu)).detach()
+        h, g = model.rollout_step(h, z, actions[:, i], speeds[:, i], None, prev)
+        zs.append(z)
+        greens.append(g)
+        prev = g
+    return zs, torch.stack(greens, 1)
+
+
+def _rollout_given(model, h, actions, speeds, n, H, prev, zs):
+    """Counterfactual steps 2-3 (action, prediction): roll out under other actions with the abducted z."""
+    greens = []
+    for k in range(H):
+        i = n - 1 + k
+        h, g = model.rollout_step(h, zs[k], actions[:, i], speeds[:, i], None, prev)
+        greens.append(g)
+        prev = g
+    return torch.stack(greens, 1)
+
+
 def _rollout(model, h, actions, speeds, n, H, prev, z_mode="sample", eps=None):
     """z_mode "sample": z = prior mean + prior std * eps[k] (eps shared between the two rollouts, so the action is the
     only difference; gradients reach the prior head too). "mean": z = the detached prior mean (v1; caution: the exact
@@ -233,8 +262,17 @@ def _rollout(model, h, actions, speeds, n, H, prev, z_mode="sample", eps=None):
 
 
 def invariance_loss(model, batch, stats, rc, dt, H=10, consts=(-3.0, -1.5, 0.0, 1.5), human_frac=0.5,
-                    fwd=8, side=2, near=2, accel=None, generator=None, z_mode="sample", guard=0.0):
+                    fwd=8, side=2, near=2, accel=None, generator=None, z_mode="sample", guard=0.0,
+                    target="rollout"):
     """-> (loss, logs). batch needs inv_nr, inv_re (B, >= H, 64, 64) bool from the mask cache.
+    target "rollout" (v1-v3): the counterfactual rollout, warped into the human frame, must agree with the human
+    rollout (prior samples with shared noise, or the prior mean: z_mode). Self-consistency without ground truth:
+    gamed by erasing (v1), fading (v2) and smearing (v3).
+    target "truth" (v4): it must match the TRUE future frame instead, on the same region around the cars that cannot
+    react (they are where they really were under any plan). z comes from abduction: the posterior of the human
+    rollout given the true frames, reused unchanged under the counterfactual actions (abduction, action,
+    prediction), so z carries what the other cars actually did and there is nothing to hedge over. A fixed target
+    makes erasing, fading, smearing and following the ego all cost. z_mode is ignored.
     guard > 0 adds guard * mean over windows of relu(1 - m_h)^2 + relu(1 - m_c)^2, WITH gradients: m = predicted green
     on the true footprints of the cars that cannot react / the true green there, for the human rollout (m_h) and the
     counterfactual one warped into the human frame (m_c). Fading both rollouts was a cheap way to lower the
@@ -246,23 +284,30 @@ def invariance_loss(model, batch, stats, rc, dt, H=10, consts=(-3.0, -1.5, 0.0, 
         raise ValueError("the invariance loss does not support --reencode (no road/ego frames under a')")
     n = model.cfg.n_cond
     imgs, act, spd = batch["images"], batch["actions"], batch["speed"]
-    e = model.encode(imgs[:, :n])
-    h0, _ = model.warmup(e, act, spd)
+    if target not in ("rollout", "truth"):
+        raise ValueError(target)
+    e = model.encode(imgs[:, :n + H] if target == "truth" else imgs[:, :n])
+    h0, _ = model.warmup(e[:, :n], act, spd)
     prev = imgs[:, n - 1, GREEN:GREEN + 1]
     cf = counterfactual_actions(batch, stats, n, H, dt, consts, human_frac, accel, generator)
-    eps = None
-    if not model.cfg.deterministic and z_mode == "sample":
-        shape = model.prior_params(h0)[0].shape
-        eps = [torch.randn(shape, device=h0.device, dtype=torch.float32) for _ in range(H)]
-    g_h = _rollout(model, h0, act, spd, n, H, prev, z_mode, eps)
-    g_c = _rollout(model, h0, cf["actions"], cf["speed"], n, H, prev, z_mode, eps)
+    if target == "truth":
+        zs, g_h = _abduct(model, h0, act, spd, e[:, n:n + H], n, H, prev)
+        g_c = _rollout_given(model, h0, cf["actions"], cf["speed"], n, H, prev, zs)
+    else:
+        eps = None
+        if not model.cfg.deterministic and z_mode == "sample":
+            shape = model.prior_params(h0)[0].shape
+            eps = [torch.randn(shape, device=h0.device, dtype=torch.float32) for _ in range(H)]
+        g_h = _rollout(model, h0, act, spd, n, H, prev, z_mode, eps)
+        g_c = _rollout(model, h0, cf["actions"], cf["speed"], n, H, prev, z_mode, eps)
     st0 = batch["ego_state"][:, n - 1].float()
     pose_h = integrate_poses(st0, *cf["human"], dt)
     pose_c = integrate_poses(st0, *cf["cf"], dt)
     g_cw, valid = warp_to(g_c, pose_c, pose_h, rc)
     M = region(batch["inv_nr"][:, :H], batch["inv_re"][:, :H], fwd, side, near) * (valid > 0.99).float()
     area = M.sum()
-    loss = (M * (g_cw - g_h.float()) ** 2).sum() / area.clamp_min(1.0)
+    ref = imgs[:, n:n + H, GREEN:GREEN + 1].float() if target == "truth" else g_h.float()
+    loss = (M * (g_cw - ref) ** 2).sum() / area.clamp_min(1.0)
     shift = (pose_c[..., :2] - pose_h[..., :2]).norm(dim=-1)[:, -1].mean()
     # mass on the true footprints of the cars that cannot react, relative to the truth (human rollout; the
     # counterfactual warped into the same frame): ~1 when cars are drawn, ~0 when erased. Logged always; with
