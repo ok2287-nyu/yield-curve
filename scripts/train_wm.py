@@ -161,6 +161,9 @@ def args_():
     p.add_argument("--inv_fwd", type=int, default=8, help="px the region grows along the ego's forward axis")
     p.add_argument("--inv_side", type=int, default=2, help="px the region grows sideways")
     p.add_argument("--inv_near", type=int, default=2, help="px around other road users left out of the region")
+    p.add_argument("--inv_guard", type=float, default=0.0,
+                   help="weight of the mass guard inside the invariance loss (0 = only logged): penalises missing car "
+                        "on the true footprints of cars that cannot react, in both rollouts (with gradients)")
     p.add_argument("--inv_z", choices=["sample", "mean"], default="sample",
                    help="latent in the two rollouts: prior samples with shared noise (v2) or the prior mean (v1)")
     p.add_argument("--steps", type=int, default=60000, help="set after timing the first run; same for all runs")
@@ -338,7 +341,7 @@ def gpu_util():
 
 LOG_FIELDS = (["step", "split", "beta", "loss", "mse", "mse_warm", "feat", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar",
                "mean_gap", "post_mu_abs", "prior_mu_abs", "post_mu_spread", "act_sens", "gap_mean", "s_per_step",
-               "gpu_util", "time", "elbo", "inv", "inv_area", "inv_shift", "inv_mass_h", "inv_mass_c"]
+               "gpu_util", "time", "elbo", "inv", "inv_area", "inv_shift", "inv_mass_h", "inv_mass_c", "inv_guard"]
               + [f"{m}@{k}" for k in REPORT_STEPS for m in ("prior", "post", "empty", "copy", "warp", "mass", "kl",
                                                              "std", "spread", "sharp")])
 
@@ -485,7 +488,7 @@ def main():
     if dev == "cuda":
         print(f"GPU {torch.cuda.get_device_name()} | {'bf16 autocast' if use_amp else 'fp32 (no native bf16)'}")
     keys = ("loss", "mse", "mse_warm", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar", "mean_gap", "post_mu_abs",
-            "prior_mu_abs", "post_mu_spread") + (("feat",) if a.arch == "dino" else ()) + (("inv", "inv_area", "inv_shift", "inv_mass_h", "inv_mass_c")
+            "prior_mu_abs", "post_mu_spread") + (("feat",) if a.arch == "dino" else ()) + (("inv", "inv_area", "inv_shift", "inv_mass_h", "inv_mass_c", "inv_guard")
                                                   if a.inv_weight > 0 else ())
     inv_consts = tuple(float(x) for x in a.inv_consts.split(","))
     last_ckpt, t0 = time.time(), time.time()
@@ -500,7 +503,8 @@ def main():
                 if a.inv_weight > 0:                 # same dropout masks as the main loss (same block)
                     inv, inv_logs = invariance_loss(model, b, stats, cfg.render, cfg.data.dt, H=a.inv_steps,
                                                     consts=inv_consts, human_frac=a.inv_human_frac,
-                                                    fwd=a.inv_fwd, side=a.inv_side, near=a.inv_near, z_mode=a.inv_z)
+                                                    fwd=a.inv_fwd, side=a.inv_side, near=a.inv_near, z_mode=a.inv_z,
+                                                    guard=a.inv_guard)
                     loss = loss + a.inv_weight * inv
                     logs = logs | inv_logs | {"loss": loss.item()}
             if not torch.isfinite(loss):
@@ -523,7 +527,7 @@ def main():
                       f"prior {m['prior_logvar']:.2f} | {sps:.3f} s/step gpu {gu}%"
                       + (f" | feat {m['feat']:.4f}" if a.arch == "dino" else "")
                       + (f" | inv {m['inv']:.5f} area {m['inv_area']:.3f} shift {m['inv_shift']:.1f} m"
-                         f" mass {m['inv_mass_h']:.2f}/{m['inv_mass_c']:.2f}"
+                         f" mass {m['inv_mass_h']:.2f}/{m['inv_mass_c']:.2f} guard {m['inv_guard']:.4f}"
                          if a.inv_weight > 0 else ""))
                 log.writerow({"step": step, "split": "train", "beta": beta_at(step, a), **m, "s_per_step": sps, "gpu_util": gu,
                               "time": time.time()})
