@@ -177,3 +177,23 @@ def test_finetuning_trains_the_encoder_and_refuses_the_feature_loss():
     m.eval()
     with torch.no_grad():                                  # eval / planning: no graph
         assert not m.encode(_batch()["images"][:, :2]).requires_grad
+
+
+def test_scheduled_sampling_interpolates_teacher_forcing_and_own_rollouts():
+    m = _model(deterministic=True, dropout=0.0)      # no dropout: the coin flips must not change the masks drawn
+    with torch.no_grad():
+        m.head[1].weight.normal_(0, 0.05)
+    m.train()
+    b = _batch()
+    feats = {}
+    for name, tf, p in (("tf", True, 1.0), ("ss0", False, 0.0), ("own", False, 1.0), ("ss1", False, 1.0)):
+        m.cfg.teacher_forcing, m.ss_p = tf, p
+        torch.manual_seed(1)
+        feats[name] = m(b["images"], b["actions"], b["speed"], P)["feat"]
+    assert torch.allclose(feats["ss0"], feats["tf"], atol=1e-5)       # p = 0: always the true frame
+    assert torch.allclose(feats["ss1"], feats["own"], atol=1e-5)      # p = 1: always its own prediction
+    assert not torch.allclose(feats["tf"][:, 2], feats["own"][:, 2])
+    m.cfg.teacher_forcing, m.ss_p = False, 0.5
+    torch.manual_seed(2)
+    half = m(b["images"], b["actions"], b["speed"], P)["feat"]
+    assert torch.isfinite(half).all()
