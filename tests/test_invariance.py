@@ -263,3 +263,54 @@ def test_guard_makes_fading_cost_and_has_gradients():
     l, _ = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=torch.full((2, H), -3.0), guard=1.0)
     l.backward()
     assert sum(p.grad.abs().sum() for p in m.parameters() if p.grad is not None) > 0
+
+
+def test_v4_truth_target_cannot_be_gamed_by_erasing_fading_or_smearing():
+    """target "truth": the counterfactual rollout (warped to the human frame) is scored against the TRUE future on the
+    region around the cars that cannot react. The true frames cost ~0; empty, faded and smeared frames all cost more
+    (v2 scored empty frames 0). z comes from the human rollout's posterior and is detached."""
+    import torch.nn.functional as F
+    import roundabout_wm.invariance as inv
+    S = _setup()
+    ds = RounDWindows(S["cache"], [0], CFG, S["stats"], inv_dir=S["inv"])
+    b = _batch(ds, [0, 3])
+    n, H = CFG.data.n_cond, 10
+    acc_h = b["actions"][:, n - 1:n - 1 + H, 0] * S["stats"]["action_std"][0] + S["stats"]["action_mean"][0]
+    m = _model().eval()
+    truth = b["images"][:, n:n + H, 1:2].float()
+    smear = F.avg_pool2d(truth.flatten(0, 1), 9, stride=1, padding=4).unflatten(0, truth.shape[:2]) * 3
+    orig = inv._rollout_given
+    losses = {}
+    try:
+        for name, fake in (("truth", truth), ("empty", torch.zeros_like(truth)), ("faded", 0.5 * truth),
+                           ("smear", smear.clamp(0, 1))):
+            inv._rollout_given = lambda *a, f=fake, **k: f.clone()
+            losses[name], _ = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=acc_h,
+                                              target="truth")
+    finally:
+        inv._rollout_given = orig
+    assert losses["truth"].item() < 1e-6
+    for k in ("empty", "faded", "smear"):
+        assert losses[k].item() > 10 * max(losses["truth"].item(), 1e-6), (k, losses[k].item())
+    # the real thing: gradients reach the action pathway and the predictor, not the posterior
+    m.train().zero_grad()
+    with m.fixed_dropout_masks():
+        l, logs = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=torch.full((2, H), -3.0),
+                                  target="truth")
+    l.backward()
+    assert l.item() > 0 and m.A[0].weight.grad.abs().sum() > 0
+    assert all(p.grad is None or p.grad.abs().sum() == 0 for p in m.posterior.parameters())
+    # deterministic models work too (z = 0)
+    md = _model(det=True).eval()
+    ld, _ = invariance_loss(md, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=acc_h, target="truth")
+    assert torch.isfinite(ld)
+
+
+def test_train_wm_smoke_with_the_truth_target():
+    S = _setup()
+    run = os.path.join(S["root"], "runs")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "train_wm.py"), "--cache", S["cache"],
+                        "--run", "inv4", "--runs_dir", run, "--steps", "2", "--batch", "4", "--workers", "0",
+                        "--val_every", "1000", "--val_batches", "1", "--inv_weight", "0.1",
+                        "--inv_masks", S["inv"], "--inv_target", "truth"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
