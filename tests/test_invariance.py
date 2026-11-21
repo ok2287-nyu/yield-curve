@@ -230,3 +230,36 @@ def test_mass_guard_detects_empty_frames():
     finally:
         inv._rollout = orig
     assert good["inv_mass_h"] > 0.8 and empty["inv_mass_h"] < 0.01
+
+
+def test_guard_makes_fading_cost_and_has_gradients():
+    """v3 (guard > 0): empty frames no longer satisfy the loss; the true frames still give ~0; the penalty has a
+    gradient into the model; guard 0 leaves the loss exactly as in v2."""
+    import roundabout_wm.invariance as inv
+    S = _setup()
+    ds = RounDWindows(S["cache"], [0], CFG, S["stats"], inv_dir=S["inv"])
+    b = _batch(ds, [0, 3])
+    n, H = CFG.data.n_cond, 10
+    acc_h = b["actions"][:, n - 1:n - 1 + H, 0] * S["stats"]["action_std"][0] + S["stats"]["action_mean"][0]
+    m = _model(det=True).eval()
+    orig = inv._rollout
+    truth = b["images"][:, n:n + H, 1:2].float()
+    try:
+        inv._rollout = lambda *a, **k: truth.clone()
+        l_true, logs_true = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=acc_h, guard=1.0)
+        inv._rollout = lambda *a, **k: torch.zeros_like(truth)
+        l_v2, _ = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=acc_h)
+        l_g, logs_g = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=acc_h, guard=1.0)
+        half = truth * 0.5                                           # faded to half intensity
+        inv._rollout = lambda *a, **k: half.clone()
+        _, logs_half = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=acc_h, guard=1.0)
+    finally:
+        inv._rollout = orig
+    assert l_v2.item() < 1e-9                                          # v2: drawing nothing costs nothing
+    assert l_g.item() > 1.5 and logs_g["inv_guard"] > 1.5              # v3: both rollouts empty -> ~2
+    assert logs_true["inv_guard"] < 0.05 and l_true.item() < 0.05      # the truth is (nearly) free
+    assert 0.3 < logs_half["inv_guard"] < 0.7                          # half-faded -> 2 * 0.5^2 = 0.5
+    m.zero_grad()
+    l, _ = invariance_loss(m, b, S["stats"], CFG.render, CFG.data.dt, H=H, accel=torch.full((2, H), -3.0), guard=1.0)
+    l.backward()
+    assert sum(p.grad.abs().sum() for p in m.parameters() if p.grad is not None) > 0

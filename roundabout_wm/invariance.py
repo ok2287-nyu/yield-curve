@@ -233,8 +233,13 @@ def _rollout(model, h, actions, speeds, n, H, prev, z_mode="sample", eps=None):
 
 
 def invariance_loss(model, batch, stats, rc, dt, H=10, consts=(-3.0, -1.5, 0.0, 1.5), human_frac=0.5,
-                    fwd=8, side=2, near=2, accel=None, generator=None, z_mode="sample"):
+                    fwd=8, side=2, near=2, accel=None, generator=None, z_mode="sample", guard=0.0):
     """-> (loss, logs). batch needs inv_nr, inv_re (B, >= H, 64, 64) bool from the mask cache.
+    guard > 0 adds guard * mean over windows of relu(1 - m_h)^2 + relu(1 - m_c)^2, WITH gradients: m = predicted green
+    on the true footprints of the cars that cannot react / the true green there, for the human rollout (m_h) and the
+    counterfactual one warped into the human frame (m_c). Fading both rollouts was a cheap way to lower the
+    difference (v2: mass ~0.62); this makes missing car cost, and m_c asks the counterfactual rollout to draw the
+    cars that cannot react at their TRUE positions (counterfactual supervision). One-sided: extra car is free here.
     Call inside the same fixed_dropout_masks() block as the main loss: both rollouts then use the same dropout masks
     (otherwise their difference would include dropout noise)."""
     if model.cfg.reencode:
@@ -259,13 +264,23 @@ def invariance_loss(model, batch, stats, rc, dt, H=10, consts=(-3.0, -1.5, 0.0, 
     area = M.sum()
     loss = (M * (g_cw - g_h.float()) ** 2).sum() / area.clamp_min(1.0)
     shift = (pose_c[..., :2] - pose_h[..., :2]).norm(dim=-1)[:, -1].mean()
-    # guard against the empty-frame solution: predicted green on the true footprints of the cars that cannot react,
-    # relative to the truth (human rollout; the counterfactual warped into the same frame), ~1 when cars are drawn
+    # mass on the true footprints of the cars that cannot react, relative to the truth (human rollout; the
+    # counterfactual warped into the same frame): ~1 when cars are drawn, ~0 when erased. Logged always; with
+    # guard > 0 also penalised (with gradients).
+    core = batch["inv_nr"][:, :H].float()[:, :, None] * (valid > 0.99).float()
+    true = imgs[:, n:n + H, GREEN:GREEN + 1].float()
+    denom_b = (core * true).sum((1, 2, 3, 4))
+    m_h = (core * g_h.float()).sum((1, 2, 3, 4)) / denom_b.clamp_min(1.0)
+    m_c = (core * g_cw).sum((1, 2, 3, 4)) / denom_b.clamp_min(1.0)
+    ok = denom_b > 1.0                                        # windows with a cannot-react car in view
+    pen = ((torch.relu(1 - m_h) ** 2 + torch.relu(1 - m_c) ** 2)[ok].mean() if ok.any()
+           else torch.zeros((), device=loss.device))
+    diff = loss
+    if guard > 0:
+        loss = diff + guard * pen
     with torch.no_grad():
-        core = batch["inv_nr"][:, :H].float()[:, :, None] * (valid > 0.99).float()
-        true = imgs[:, n:n + H, GREEN:GREEN + 1].float()
-        denom = (core * true).sum().clamp_min(1.0)
+        denom = denom_b.sum().clamp_min(1.0)
         mass_h = ((core * g_h.float()).sum() / denom).item()
         mass_c = ((core * g_cw).sum() / denom).item()
-    return loss, {"inv": loss.item(), "inv_area": (area / M[:, :, 0].numel()).item(), "inv_shift": shift.item(),
-                  "inv_mass_h": mass_h, "inv_mass_c": mass_c}
+    return loss, {"inv": diff.item(), "inv_area": (area / M[:, :, 0].numel()).item(), "inv_shift": shift.item(),
+                  "inv_mass_h": mass_h, "inv_mass_c": mass_c, "inv_guard": pen.item()}
