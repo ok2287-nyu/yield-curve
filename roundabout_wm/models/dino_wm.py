@@ -22,7 +22,9 @@ Losses (per training window)
     pix    pix_weight * MSE(Dec(predicted features), true others channel)
     kl     beta * KL(q || p) (+ anchor_prior * KL(p || N(0, I)))
 Training is teacher-forced by default (DINO-WM): after each step the buffer gets the TRUE next features, so all
-steps learn from real history. teacher_forcing=False rolls out on its own predictions instead.
+steps learn from real history. teacher_forcing=False rolls out on its own predictions instead. Scheduled sampling
+(Bengio et al. 2015): with teacher_forcing=False, model.ss_p < 1 makes each step of each window take the model's own
+prediction with probability ss_p and the true frame otherwise (train_wm.py --ss_steps ramps ss_p 0 -> 1).
 
 State h, so imagine() / warm_states() / the planners work unchanged: the buffer of the last K frames, each frame
 D feature channels + 3 channels (acc, curv, v, broadcast over the grid), flattened to (B, K * (D + 3), 8, 8).
@@ -175,6 +177,7 @@ class DinoWM(nn.Module):
             import dataclasses
             cfg = self.cfg = dataclasses.replace(cfg, hidden=hidden_size(cfg.dino, K, cfg.dino_size))
         self.K, self.D = K, D
+        self.ss_p = 1.0          # scheduled sampling: P(own prediction) per step when not teacher-forced; 1 = off
         self.encoder = FrozenDino(cfg.dino, cfg.dino_size, cfg.dino_ft)
         self.embed = nn.Linear(D + 3, W)
         self.pos_space = nn.Parameter(torch.zeros(1, 1, 64, W))
@@ -294,6 +297,7 @@ class DinoWM(nn.Module):
         if z_source == "mix" and open_loop is None:
             open_loop = torch.rand(B, device=dev) < cfg.p_openloop
         tf = self.training and cfg.teacher_forcing and T_enc > n
+        ss = self.training and not cfg.teacher_forcing and self.ss_p < 1.0 and T_enc > n
         feats, greens, kls, anchors, stds, std_maps, zs, lat = [], [], [], [], [], [], [], []
         for k in range(n_pred):
             i = n - 1 + k
@@ -333,7 +337,14 @@ class DinoWM(nn.Module):
             feats.append(f_next)
             greens.append(self.decode(f_next))
             zs.append(z.detach())
-            h = self.advance(h, actions[:, i], speeds[:, i], e[:, i + 1].float() if tf else f_next)
+            if tf:
+                nxt = e[:, i + 1].float()
+            elif ss:                                   # per window: own prediction with probability ss_p
+                own = (torch.rand(B, device=dev) < self.ss_p).view(B, 1, 1, 1)
+                nxt = torch.where(own, f_next, e[:, i + 1].float())
+            else:
+                nxt = f_next
+            h = self.advance(h, actions[:, i], speeds[:, i], nxt)
         return {"green": torch.stack(greens, 1), "green_warm": green_warm,
                 "feat": torch.stack(feats, 1), "feat_true": e[:, n:n + n_pred].float() if T_enc > n else None,
                 "kl": torch.stack(kls, 1) if kls else None,

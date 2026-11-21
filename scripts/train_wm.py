@@ -92,6 +92,9 @@ def args_():
     p.add_argument("--pred_heads", type=int, default=6)
     p.add_argument("--teacher_forcing", action=argparse.BooleanOptionalAction, default=True,
                    help="--arch dino: train on true history (DINO-WM); --no-teacher_forcing rolls out on predictions")
+    p.add_argument("--ss_steps", type=int, default=0,
+                   help="--arch dino --no-teacher_forcing: scheduled sampling, P(own prediction) ramps linearly 0 -> 1 "
+                        "over this many steps, then stays 1 (0 = off: always own predictions)")
     p.add_argument("--dino_size", type=int, default=112,
                    help="--arch dino: input size; 224 = 16x16 patches of 4 raster px, stacked 2x2 into the 8x8 grid")
     p.add_argument("--dino_ft", type=int, default=0,
@@ -185,6 +188,8 @@ def args_():
         p.error("--inv_weight needs --inv_masks (scripts/build_inv_masks.py)")
     if a.inv_weight > 0 and a.reencode:
         p.error("--inv_weight does not support --reencode")
+    if a.ss_steps > 0 and (a.arch != "dino" or a.teacher_forcing):
+        p.error("--ss_steps needs --arch dino --no-teacher_forcing")
     return a
 
 
@@ -496,6 +501,8 @@ def main():
     model.train()
     while step < a.steps:
         for b in train_loader:
+            if a.ss_steps > 0:                       # scheduled sampling: P(own prediction) 0 -> 1
+                model.ss_p = min(1.0, step / a.ss_steps)
             b = to(b, dev)
             masks = model.fixed_dropout_masks() if a.dropout_masks == "sequence" else contextlib.nullcontext()
             with masks, torch.autocast(dev, dtype=torch.bfloat16, enabled=use_amp):
