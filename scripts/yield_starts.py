@@ -41,8 +41,9 @@ Prints, per checkpoint:
       step k and scope (all cells / the stopped road users' cells within 4.5 m / every other cell) the reference with
       ONLY that latent resampled from e1. Prints, per step and scope, the share of stopped road users whose go/wait
       outcome flips, and writes flip_<run>.png (examples: reference vs flipped at 2 s, |difference|). Flips at step
-      1-2 = an early latent tips the decision and the state keeps it; flips spread thinly over steps, summing well
-      below the full resample = accumulated; flips from "elsewhere" = the decision depends on other cells (e.g. the
+      1-2 = an early latent tips the decision and the state keeps it; one step's flips equal to
+      the full resample = that step decides; flips spread over steps summing to ~sqrt(steps) x the full resample =
+      accumulated; flips from "elsewhere" = the decision depends on other cells (e.g. the
       ring traffic), not on the car's own latent. Cells of nearby stopped road users share the "its cells" scope.
 Writes yield_starts_<run>.csv (one row per stopped road user) and yield_starts.png (sigma_p vs steps to start).
 No rounD images in the outputs. CPU is fine but slow; a GPU job is faster.
