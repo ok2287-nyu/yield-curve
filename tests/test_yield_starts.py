@@ -125,11 +125,12 @@ def test_script_smoke():
     out = os.path.join(root, "ys")
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "yield_starts.py"), "--cache", cache,
                         "--data_dir", raw, "--ckpts", ck, "--n_windows", "40", "--batch", "4",
-                        "--region", "42", "-50", "10", "--out_dir", out, "--k", "2"],
+                        "--region", "42", "-50", "10", "--out_dir", out, "--k", "2", "--masks", "2"],
                        capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=ROOT), cwd=root)
     assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-1500:]
     assert "AUROC start_2s vs stays" in r.stdout and "aligned to the start" in r.stdout, r.stdout[-1500:]
     assert "imagined futures (2 prior samples each)" in r.stdout and "drive off" in r.stdout
+    assert "dropout (2 masks" in r.stdout and "do the masks flag" in r.stdout
     d = pd.read_csv(os.path.join(out, "yield_starts_fake.csv"))
     assert {"stays", "start_2s"} <= set(d.label) and d.p_start.between(0, 1).all()
     assert os.path.exists(os.path.join(out, "yield_starts.png"))
