@@ -197,8 +197,13 @@ def flip_report(d, H):
     for k in range(H):
         print(f"      {k + 1:4d} " + " ".join(f"{d[f'flip_{sc}_{k}'].mean():10.3f}" for sc in SCOPES))
     tot = {sc: sum(d[f"flip_{sc}_{k}"].mean() for k in range(H)) for sc in SCOPES}
+    full = max(float(d.flip_full.mean()), 1e-9)
+    peak = int(np.argmax([d[f"flip_all_{k}"].mean() for k in range(H)])) + 1
     print("      sum over steps: " + ", ".join(f"{sc} {v:.3f}" for sc, v in tot.items())
-          + "  (well below the full resample = no single step decides: accumulated)")
+          + f"; sum / full resample = {tot['all'] / full:.1f}, peak at step {peak}")
+    print("      reading: one step decides -> its flips equal the full resample and the others are ~0 (ratio ~1); a\n"
+          "      threshold on a SUM of small per-step contributions -> flips spread over steps and the ratio is ~sqrt(steps)\n"
+          "      (> 1: one swap can tip it, swapping all tends to cancel); tipped early and kept -> peak at step 1-2")
     if "p_start" in d:
         c = d[(d.p_start > 0) & (d.p_start < 1)]
         if len(c):
