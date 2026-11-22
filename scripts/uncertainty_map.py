@@ -29,6 +29,9 @@ Writes, next to the first checkpoint unless --out_dir:
     uncertainty_<run>.png   the maps averaged in WORLD coordinates (3 m bins) over the roundabout photo
     uncertainty_<run>.npz   the world grids (sum, count) for each map
     uncertainty_stats.csv   the numbers above
+--masks M: M rollouts per window that differ ONLY in the MC-dropout mask (one fixed mask per rollout, the same prior
+noise for all; the planner's epistemic estimate). Adds a fifth map, drop = std over the masks of the predicted
+green per cell, to every statistic, plot and (with --motion_bins) the motion control.
 Confound checks (all off by default):
     --edge_cells N   drop cells within N cells (6 m each) of the crop border, everywhere (stats, maps, hotspots):
                      a road user entering the 48 m view is unknowable, which inflates the map at the arm ends.
@@ -134,6 +137,43 @@ def true_motion(b, n, H, rc):
     return F.avg_pool2d(d.flatten(0, 1)[:, None], 8)[:, 0].view(*d.shape[:2], 8, 8)
 
 
+@torch.no_grad()
+def dropout_rollouts(m, b, n, H, M):
+    """M prior rollouts that differ ONLY in the dropout mask (MC dropout, one fixed mask per rollout, as the planner's
+    epistemic estimate): warm-up on the real frames without dropout, then the same prior noise for every mask.
+    -> (M, B, H, 64, 64) predicted green."""
+    imgs, act, spd = b["images"], b["actions"], b["speed"]
+    B = imgs.shape[0]
+    was = m.training
+    m.eval()
+    e = m.encode(imgs[:, :n])
+    h0, _ = m.warmup(e, act, spd)
+    eps = [None] * H
+    outs = []
+    try:
+        for _ in range(M):
+            m.train()
+            with m.fixed_dropout_masks():
+                h, prev = h0, imgs[:, n - 1, GREEN:GREEN + 1]
+                gs = []
+                for k in range(H):
+                    i = n - 1 + k
+                    frame = None
+                    if m.cfg.reencode:
+                        frame = imgs[:, i] if k == 0 else torch.cat([imgs[:, i, :GREEN], prev.to(imgs.dtype),
+                                                                     imgs[:, i, GREEN + 1:]], 1)
+                    mu, lv = m.prior_params(h)
+                    if eps[k] is None:
+                        eps[k] = torch.randn_like(mu)
+                    z = m.zero_z(B, h.device) if m.cfg.deterministic else mu + (0.5 * lv).exp() * eps[k]
+                    h, prev = m.rollout_step(h, z, act[:, i], spd[:, i], frame, prev)
+                    gs.append(prev[:, 0].float())
+                outs.append(torch.stack(gs, 1))
+    finally:
+        m.train(was)
+    return torch.stack(outs)
+
+
 def edge_keep(B, H, edge_cells):
     """(B*H*64,) bool: False for cells within edge_cells cells of the crop border."""
     r = np.arange(8)
@@ -167,6 +207,7 @@ def main():
     p.add_argument("--occ_only", action="store_true", help="world maps over road-user cells only (files get _occ)")
     p.add_argument("--top", type=int, default=8, help="print this many hotspot bins per map")
     p.add_argument("--edge_cells", type=int, default=0, help="drop cells this many cells from the crop border")
+    p.add_argument("--masks", type=int, default=0, help="MC-dropout rollouts per window: adds the 'drop' map (0 = off)")
     p.add_argument("--motion_bins", type=int, default=0, help="motion-quantile control (0 = off)")
     p.add_argument("--fork_xy", type=float, nargs=2, default=None, metavar=("X", "Y"), help="fork/blur sheet here")
     p.add_argument("--fork_r", type=float, default=4.5, help="m around --fork_xy")
@@ -191,9 +232,10 @@ def main():
             print(f"\n{run}: deterministic, no uncertainty; skipped"); continue
         ds = RounDWindows(a.cache, split, cfg, s["stats"], n_pred=cfg.data.n_pred)
         idx = np.sort(np.random.default_rng(a.seed).choice(len(ds), min(a.n_windows, len(ds)), replace=False))
-        grid = {k: np.zeros((ny, nx)) for k in MAPS}
+        keys = MAPS + (("drop",) if a.masks else ())
+        grid = {k: np.zeros((ny, nx)) for k in keys}
         cnt = np.zeros((ny, nx))
-        cols = {k: [] for k in MAPS + ("occ", "motion", "win", "step", "cell", "wx", "wy", "gx", "gy", "inb")}
+        cols = {k: [] for k in keys + ("occ", "motion", "win", "step", "cell", "wx", "wy", "gx", "gy", "inb")}
         within = []
         for j in range(0, len(idx), a.batch):
             items = [ds[int(i)] for i in idx[j:j + a.batch]]
@@ -206,6 +248,10 @@ def main():
                     "sigma_p": sig if sig is not None else torch.full_like(spread, float("nan")),
                     "kl": kl if kl is not None else torch.full_like(spread, float("nan"))}
             vals["motion"] = true_motion(b, n, H, rc)
+            if a.masks:
+                gd = dropout_rollouts(m, b, n, H, a.masks)                                  # (M, B, H, 64, 64)
+                sd = gd.std(0, unbiased=True)
+                vals["drop"] = F.avg_pool2d(sd.flatten(0, 1)[:, None], 8)[:, 0].view(B, H, 8, 8)
             vals = {k: v.cpu().numpy() for k, v in vals.items()}
             if sig is not None:
                 sg = vals["sigma_p"].reshape(B * H, 64)
@@ -220,7 +266,7 @@ def main():
             extra = {"occ": occ.cpu().numpy().ravel(), "win": np.repeat(idx[j:j + a.batch], H * 64),
                      "step": np.tile(np.repeat(np.arange(H), 64), B), "cell": np.tile(np.arange(64), B * H),
                      "wx": xy[:, 0], "wy": xy[:, 1], "gx": gx, "gy": gy, "inb": ok}
-            for k in MAPS + ("motion",):
+            for k in keys + ("motion",):
                 cols[k].append(vals[k].ravel()[keep])
             for k, v in extra.items():
                 cols[k].append(v[keep])
@@ -228,7 +274,7 @@ def main():
             if a.occ_only:
                 ok &= occ.cpu().numpy().reshape(-1)
             np.add.at(cnt, (gy[ok], gx[ok]), 1)
-            for k in MAPS:
+            for k in keys:
                 v = vals[k].reshape(-1)
                 if np.isfinite(v).any():
                     np.add.at(grid[k], (gy[ok], gx[ok]), np.nan_to_num(v[ok]))
@@ -245,13 +291,13 @@ def main():
                   f"(std over cells / mean) {w:.3f}")
             row.update(sigma_p5=q[0], sigma_p50=q[1], sigma_p95=q[2], sigma_within_cv=w)
         print(f"  {'map':8s} {'road-user cells':>16s} {'empty cells':>12s} {'ratio':>7s}")
-        for k in MAPS:
+        for k in keys:
             a1, a0 = df.loc[df.occ, k].mean(), df.loc[~df.occ, k].mean()
             if np.isfinite(a1):
                 print(f"  {k:8s} {a1:16.4f} {a0:12.4f} {a1 / max(a0, 1e-12):7.2f}")
                 row.update({f"{k}_occ": a1, f"{k}_empty": a0})
         sub = df.sample(min(len(df), a.max_corr), random_state=a.seed)
-        use = [k for k in MAPS if np.isfinite(sub[k]).all() and sub[k].std() > 1e-9]
+        use = [k for k in keys if np.isfinite(sub[k]).all() and sub[k].std() > 1e-9]
         corr = sub[use].corr(method="spearman")
         print("  Spearman correlations over cell-steps:")
         print("  " + corr.round(2).to_string().replace("\n", "\n  "))
@@ -275,9 +321,9 @@ def main():
         stats.append(row)
         tag = ("_occ" if a.occ_only else "") + (f"_e{a.edge_cells}" if a.edge_cells else "")
         np.savez(os.path.join(out_dir, f"uncertainty_{run}{tag}.npz"), count=cnt, bin=a.bin, bg_m_per_px=bg_m,
-                 **{k: grid[k] for k in MAPS})
-        plot(run, grid, cnt, bg, bg_m, a, os.path.join(out_dir, f"uncertainty_{run}{tag}.png"))
-        hotspots(grid, cnt, a)
+                 **{k: grid[k] for k in keys})
+        plot(run, grid, cnt, bg, bg_m, a, os.path.join(out_dir, f"uncertainty_{run}{tag}.png"), keys)
+        hotspots(grid, cnt, a, keys)
         if a.motion_bins:
             row.update(motion_check(df, run, bg, bg_m, a, (ny, nx), os.path.join(out_dir, f"uncertainty_{run}{tag}_motion.png")))
         if a.fork_xy is not None:
@@ -331,25 +377,38 @@ def motion_check(df, run, bg, bg_m, a, shape, path):
     raw = d[["sigma_p", "err"]].corr(method="spearman").iloc[0, 1]
     print("    Spearman with motion: " + ", ".join(f"{k} {v:.2f}" for k, v in rho_m.items()))
     print(f"    sigma_p vs err: {raw:.2f} raw, {partial:.2f} with motion taken out (rank residuals)")
+    out = {}
+    for k in ("spread", "drop"):
+        if k in d and d[k].std() > 1e-12:
+            pr = float(np.corrcoef(_rank_resid(d[k], d.motion), _rank_resid(d.err, d.motion))[0, 1])
+            print(f"    {k} vs err: {d[[k, 'err']].corr(method='spearman').iloc[0, 1]:.2f} raw, {pr:.2f} with motion "
+                  f"taken out")
+            out[f"rho_occ_{k}_err_motion_out"] = pr
+    if "drop" in d:
+        print(f"    drop vs sigma_p {d[['drop', 'sigma_p']].corr(method='spearman').iloc[0, 1]:.2f}, "
+              f"drop vs spread {d[['drop', 'spread']].corr(method='spearman').iloc[0, 1]:.2f}")
     # world maps relative to the motion bin
-    for k in ("sigma_p", "err"):
+    rel = ("sigma_p", "err") + (("drop",) if "drop" in d else ())
+    for k in rel:
         d[k + "_rel"] = d[k] / d.groupby("mbin")[k].transform("mean")
     d = d[d.inb]
     ny, nx = shape
     cnt = np.zeros(shape)
     np.add.at(cnt, (d.gy.to_numpy(), d.gx.to_numpy()), 1)
     grids = {}
-    for k in ("motion", "sigma_p_rel", "err_rel"):
+    panels = ("motion",) + tuple(k + "_rel" for k in rel)
+    for k in panels:
         grids[k] = np.zeros(shape)
         np.add.at(grids[k], (d.gy.to_numpy(), d.gx.to_numpy()), d[k].to_numpy())
     titles = {"motion": "motion: |true change| not explained by ego motion",
-              "sigma_p_rel": "prior sigma / mean for its motion bin", "err_rel": "error / mean for its motion bin"}
+              "sigma_p_rel": "prior sigma / mean for its motion bin", "err_rel": "error / mean for its motion bin",
+              "drop_rel": "dropout spread / mean for its motion bin"}
     _world_panels(grids, cnt, titles, bg, bg_m, a, f"{run}: road-user cells, motion-controlled", path,
-                  center={"sigma_p_rel": 1.0, "err_rel": 1.0})
+                  center={k: 1.0 for k in panels[1:]})
     sub = argparse.Namespace(**{**vars(a), "occ_only": True})
     print("  hotspots after the motion control (value 1 = as uncertain as its motion predicts):")
-    hotspots(grids, cnt, sub, keys=("sigma_p_rel", "err_rel"))
-    return {"rho_occ_sigma_err_motion_out": partial, **{f"rho_occ_{k}_motion": v for k, v in rho_m.items()}}
+    hotspots(grids, cnt, sub, keys=panels[1:])
+    return {"rho_occ_sigma_err_motion_out": partial, **out, **{f"rho_occ_{k}_motion": v for k, v in rho_m.items()}}
 
 
 @torch.no_grad()
@@ -450,7 +509,7 @@ def _world_panels(grids, cnt, titles, bg, bg_m, a, suptitle, path, center=None):
     fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
 
 
-def plot(run, grid, cnt, bg, bg_m, a, path):
+def plot(run, grid, cnt, bg, bg_m, a, path, keys=MAPS):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -463,9 +522,10 @@ def plot(run, grid, cnt, bg, bg_m, a, path):
     ys, xs = np.where(seen)
     zoom = [xs.min() * a.bin - 10, (xs.max() + 1) * a.bin + 10, -(ys.max() + 1) * a.bin - 10, -ys.min() * a.bin + 10]
     titles = {"sigma_p": "prior sigma (learned prior)", "kl": "KL: surprise by the real future",
-              "spread": "spread between prior samples", "err": "error of the sample mean"}
-    fig, axes = plt.subplots(1, 4, figsize=(22, 6))
-    for ax, k in zip(axes, MAPS):
+              "spread": "spread between prior samples", "err": "error of the sample mean",
+              "drop": "spread between dropout masks (same z)"}
+    fig, axes = plt.subplots(1, len(keys), figsize=(5.5 * len(keys), 6))
+    for ax, k in zip(axes, keys):
         ax.imshow(bg, cmap="gray", extent=ext_bg, alpha=0.6)
         mean = np.where(seen, grid[k] / np.maximum(cnt, 1), np.nan)
         if np.isfinite(mean).any() and np.nanmax(mean) > np.nanmin(mean):

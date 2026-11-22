@@ -119,3 +119,35 @@ def test_script_edge_motion_fork():
     assert e["count"].sum() < o["count"].sum()
     for f in ("uncertainty_fake_occ_e1_motion.png", "fork_fake_occ_e1.png"):
         assert os.path.exists(os.path.join(out, f)), f
+
+
+def test_dropout_rollouts_differ_only_by_mask():
+    """Same prior noise for every mask: with dropout 0 all rollouts are identical; with dropout 0.1 they differ.
+    The model is left in eval mode."""
+    from uncertainty_map import dropout_rollouts
+    cfg = Config()
+    n, H = cfg.data.n_cond, 3
+    g = torch.Generator().manual_seed(0)
+    b = {"images": (torch.rand(2, n + 5, 3, 64, 64, generator=g) > 0.9).float(),
+         "actions": torch.randn(2, n + 4, 2, generator=g), "speed": torch.randn(2, n + 5, 1, generator=g)}
+    for p, differ in ((0.0, False), (0.1, True)):
+        torch.manual_seed(0)
+        m = WorldModel(WMConfig(n_cond=n, dropout=p)).eval()
+        out = dropout_rollouts(m, b, n, H, 3)
+        assert out.shape == (3, 2, H, 64, 64) and not m.training
+        d = (out[1:] - out[0]).abs().max().item()
+        assert (d > 1e-4) == differ, (p, d)
+
+
+def test_script_masks_map():
+    import subprocess
+    import test_action_gain as tag
+    S = tag._setup()
+    out = os.path.join(S["root"], "unc3")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "uncertainty_map.py"), "--cache", S["cache"],
+                        "--data_dir", S["raw"], "--ckpts", S["ck"], "--n_windows", "6", "--k", "2", "--batch", "3",
+                        "--min_count", "1", "--out_dir", out, "--occ_only", "--masks", "2", "--motion_bins", "2"],
+                       capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=ROOT), cwd=S["root"])
+    assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-2500:]
+    assert "drop vs err" in r.stdout and "drop vs sigma_p" in r.stdout
+    assert "drop" in np.load(os.path.join(out, "uncertainty_fake_occ.npz")).files

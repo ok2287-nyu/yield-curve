@@ -34,6 +34,9 @@ Prints, per checkpoint:
       user drive off (footprint > 30 % empty while the green within 4.5 m stays >= 60 %) or vanish (green gone)?
       Per true label, the AUROC of that share for start_2s vs stays, and the imagined vs true start step. A narrow
       prior is only a failure if the model also does not IMAGINE the start: this says which.
+    - with --masks M, M MC-dropout rollouts (the same prior noise, only the dropout mask differs): the same shares
+      for the masks, how often the masks disagree, and (with --k) whether mask disagreement flags the road users on
+      which the latent samples all agree and are wrong: can an epistemic penalty catch confident mistakes?
 Writes yield_starts_<run>.csv (one row per stopped road user) and yield_starts.png (sigma_p vs steps to start).
 No rounD images in the outputs. CPU is fine but slow; a GPU job is faster.
 """
@@ -54,7 +57,7 @@ from roundabout_wm.config import Config
 from roundabout_wm.dataset import RounDWindows
 from roundabout_wm.models.world_model import GREEN, WMConfig, WorldModel
 from roundabout_wm.wm_eval import warp_previous
-from uncertainty_map import posterior_track
+from uncertainty_map import dropout_rollouts, posterior_track
 
 
 def _shift(a, b, reg):
@@ -159,6 +162,29 @@ def report(d, H, title):
             print(f"    timing where the samples drive off: imagined step {hit.k_pred.mean():.1f} vs true "
                   f"{hit.start.mean():.1f} (+1 = 0.2 s later), n {len(hit)}")
         row["auroc_samples"] = a
+    if "p_mask" in d:
+        print(f"    dropout ({int(d.n_masks.iloc[0])} masks, same prior noise): share of masks where it drives off / "
+              f"vanishes")
+        for lab, g in (("start within 2 s", s2), ("start 2-4 s", s4), ("stays", st)):
+            if len(g):
+                print(f"      truly {lab:17s} drives off {g.p_mask.mean():.2f}   vanishes {g.p_mask_fade.mean():.2f}")
+        go = (d.label == "start_2s").astype(int)
+        msplit = d.p_mask * (1 - d.p_mask)
+        print(f"    masks disagree (not all the same) on {(msplit > 0).mean():.2f} of stopped road users; AUROC of the "
+              f"mask share, start_2s vs stays {auroc(s2.p_mask, st.p_mask):.2f}")
+        row["auroc_masks"] = auroc(s2.p_mask, st.p_mask)
+        if "p_start" in d:
+            lsplit = d.p_start * (1 - d.p_start)
+            wrong = ((d.p_start > 0.5).astype(int) != go)
+            conf = (d.p_start <= 1 / 8) | (d.p_start >= 7 / 8)
+            rho = lambda x, y: pd.concat([x, y], axis=1).corr(method="spearman").iloc[0, 1]
+            print(f"    Spearman mask disagreement vs latent disagreement {rho(msplit, lsplit):.2f}; vs being wrong "
+                  f"(latent majority) {rho(msplit, wrong.astype(float)):.2f}")
+            cw, cr = msplit[conf & wrong], msplit[conf & ~wrong]
+            print(f"    the latent samples all agree on {conf.mean():.2f} of them and are wrong on {(conf & wrong).sum()}"
+                  f": do the masks flag those? mask disagreement wrong {cw.mean():.3f} vs right {cr.mean():.3f}, "
+                  f"AUROC {auroc(cw, cr):.2f}")
+            row["auroc_masks_flag_confident_wrong"] = auroc(cw, cr)
     if len(s2):
         cols = [f"sig_{k}" for k in range(H)]
         rel = {}
@@ -187,6 +213,7 @@ def main():
     p.add_argument("--min_area", type=int, default=6)
     p.add_argument("--region", type=float, nargs=3, default=None, metavar=("X", "Y", "R"))
     p.add_argument("--k", type=int, default=0, help="prior rollouts per window: does the model IMAGINE the start?")
+    p.add_argument("--masks", type=int, default=0, help="MC-dropout rollouts per window (same prior noise, 0 = off)")
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out_dir", default=None)
@@ -219,6 +246,8 @@ def main():
             if a.k:
                 from ladder import scheduled_rollout
                 gs = torch.stack([scheduled_rollout(m, b, n, H, lambda q: "prior") for _ in range(a.k)], 1)
+            if a.masks:
+                gd = dropout_rollouts(m, b, n, H, a.masks).transpose(0, 1)               # (B, M, H, 64, 64)
             green, pose = b["images"][:, :, GREEN].float(), b["ego_state"][..., :3]
             for bi in range(len(items)):
                 for u in stopped_users(green[bi], pose[bi], n, a.n_future, rc, a.min_area):
@@ -243,6 +272,11 @@ def main():
                         r.update(k_samples=a.k, p_start=len(ks) / a.k,
                                  p_fade=sum(1 for q, fd in res if q >= 0 and fd) / a.k,
                                  k_pred=float(np.mean(ks)) if ks else -1.0)
+                    if a.masks:
+                        res = [sample_start(gd[bi, q], u) for q in range(a.masks)]
+                        r.update(n_masks=a.masks,
+                                 p_mask=sum(1 for q, fd in res if q >= 0 and not fd) / a.masks,
+                                 p_mask_fade=sum(1 for q, fd in res if q >= 0 and fd) / a.masks)
                     rows.append(r)
         d = pd.DataFrame(rows)
         print(f"\n{run}: {len(idx)} windows, horizon {H * 0.2:.1f} s, 'stays' = still there after "
