@@ -13,7 +13,7 @@ import torch
 
 from roundabout_wm.config import Config
 from roundabout_wm.wm_eval import warp_previous
-from yield_starts import auroc, stopped_users
+from yield_starts import auroc, sample_start, stopped_users
 
 
 def _scene(move_at):
@@ -83,6 +83,24 @@ def test_real_renders_parked_and_starting_cars():
 V_EGO = 6.0
 
 
+def test_sample_start_tells_driving_off_from_vanishing():
+    green, pose, n, F, rc = _scene(move_at=100)                      # both cars parked in the truth
+    us = sorted(stopped_users(green, pose, n, F, rc), key=lambda u: u["mask"].nonzero()[:, 1].float().mean())
+    b = us[1]
+    fut = green[n:n + 10].clone()
+    assert sample_start(fut, b) == (-1, False)
+    off = fut.clone()
+    cols = b["mask"].nonzero()[:, 1]
+    lo, hi = int(cols.min()), int(cols.max()) + 1
+    off[4:, :, lo:hi + 3] = 0.0
+    off[4:, :, lo + 3:hi + 3] = fut[4:, :, lo:hi]                     # car B slides 3 px (2.25 m) from step 4
+    assert sample_start(off, b) == (4, False)
+    gone = fut.clone()
+    gone[4:, :, lo:hi] = 0.0                                          # car B vanishes from step 4
+    assert sample_start(gone, b) == (4, True)
+    assert sample_start(fut, us[0]) == (-1, False)
+
+
 def test_auroc():
     assert auroc([2, 3], [0, 1]) == 1.0 and auroc([0, 1], [2, 3]) == 0.0
     assert auroc([1, 1], [1, 1]) == 0.5 and np.isnan(auroc([], [1]))
@@ -107,10 +125,11 @@ def test_script_smoke():
     out = os.path.join(root, "ys")
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "yield_starts.py"), "--cache", cache,
                         "--data_dir", raw, "--ckpts", ck, "--n_windows", "40", "--batch", "4",
-                        "--region", "42", "-50", "10", "--out_dir", out],
+                        "--region", "42", "-50", "10", "--out_dir", out, "--k", "2"],
                        capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=ROOT), cwd=root)
     assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-1500:]
     assert "AUROC start_2s vs stays" in r.stdout and "aligned to the start" in r.stdout, r.stdout[-1500:]
+    assert "imagined futures (2 prior samples each)" in r.stdout and "drive off" in r.stdout
     d = pd.read_csv(os.path.join(out, "yield_starts_fake.csv"))
-    assert {"stays", "start_2s"} <= set(d.label)
+    assert {"stays", "start_2s"} <= set(d.label) and d.p_start.between(0, 1).all()
     assert os.path.exists(os.path.join(out, "yield_starts.png"))

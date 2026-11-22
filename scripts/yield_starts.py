@@ -30,6 +30,10 @@ Prints, per checkpoint:
     - mean sigma_p aligned to the start step (k - k* = -4 .. 0) for starters vs the stayers' mean at the same steps:
       does the prior widen as the start approaches?
     - with --region X Y R, everything again for road users whose footprint centre is within R m of (X, Y)
+    - with --k K, K imagined futures (prior rollouts over --horizon) per window: in how many does the stopped road
+      user drive off (footprint > 30 % empty while the green within 4.5 m stays >= 60 %) or vanish (green gone)?
+      Per true label, the AUROC of that share for start_2s vs stays, and the imagined vs true start step. A narrow
+      prior is only a failure if the model also does not IMAGINE the start: this says which.
 Writes yield_starts_<run>.csv (one row per stopped road user) and yield_starts.png (sigma_p vs steps to start).
 No rounD images in the outputs. CPU is fine but slow; a GPU job is faster.
 """
@@ -91,6 +95,8 @@ def stopped_users(green, pose, n, n_future, rc, min_area=6, border=4, still=0.5,
             continue
         mask = cm
         fp = _warp(mask, pose[n - 1], pose[n:n + n_future], rc) > 0.5                 # (n_future, 64, 64)
+        near = torch.from_numpy(cv2.dilate((lab == c).astype(np.uint8), np.ones((13, 13), np.uint8)) > 0)
+        near = _warp(near.to(green.device), pose[n - 1], pose[n:n + n_future], rc) > 0.5  # +-4.5 m around it
         start = -1
         for k in range(n_future):
             if fp[k].sum() < 0.5 * area:                                               # footprint left the crop
@@ -99,8 +105,23 @@ def stopped_users(green, pose, n, n_future, rc, min_area=6, border=4, still=0.5,
             if (green[n + k][fp[k]] < 0.5).float().mean() > moved:
                 start = k
                 break
-        out.append({"mask": mask, "start": start, "fp": fp, "area": int(area)})
+        out.append({"mask": mask, "start": start, "fp": fp, "near": near, "area": int(area),
+                    "mass0": float(g1[torch.from_numpy(cv2.dilate((lab == c).astype(np.uint8),
+                                                                  np.ones((13, 13), np.uint8)) > 0).to(green.device)].sum())})
     return out
+
+
+def sample_start(g, u, moved=0.3, keep=0.6):
+    """One imagined future g (H, 64, 64) for stopped road user u -> (k, faded): k = first step where > moved of its
+    footprint is empty (-1 = never within H), faded = at that step the green within +-4.5 m of it fell below keep x
+    what was there at n-1 (the road user vanished rather than drove off)."""
+    for k in range(g.shape[0]):
+        f = u["fp"][k]
+        if not f.any():
+            return -1, False
+        if (g[k][f] < 0.5).float().mean() > moved:
+            return k, float(g[k][u["near"][k]].sum()) < keep * u["mass0"]
+    return -1, False
 
 
 def auroc(pos, neg):
@@ -124,6 +145,20 @@ def report(d, H, title):
         print(f"    {name:7s} at step 1: starters {s2[key].mean():.3f} vs stayers {st[key].mean():.3f} | "
               f"AUROC start_2s vs stays {a1:.2f}, vs everyone else {a2:.2f}")
         row.update({f"auroc_{name}_vs_stays": a1, f"auroc_{name}_vs_rest": a2})
+    if "p_start" in d:
+        print(f"    imagined futures ({int(d.k_samples.iloc[0])} prior samples each): share of samples where it "
+              f"drives off within {H * 0.2:.0f} s / where it vanishes instead")
+        for lab, g in (("start within 2 s", s2), ("start 2-4 s", s4), ("stays", st)):
+            if len(g):
+                print(f"      truly {lab:17s} drives off {g.p_start.mean():.2f}   vanishes {g.p_fade.mean():.2f}   "
+                      f"(n {len(g)})")
+        a = auroc(s2.p_start, st.p_start)
+        print(f"    AUROC of 'share of samples that drive off', start_2s vs stays: {a:.2f}")
+        hit = s2[s2.k_pred >= 0]
+        if len(hit):
+            print(f"    timing where the samples drive off: imagined step {hit.k_pred.mean():.1f} vs true "
+                  f"{hit.start.mean():.1f} (+1 = 0.2 s later), n {len(hit)}")
+        row["auroc_samples"] = a
     if len(s2):
         cols = [f"sig_{k}" for k in range(H)]
         rel = {}
@@ -151,6 +186,7 @@ def main():
     p.add_argument("--n_future", type=int, default=20, help="steps for 'stays' (20 = 4 s; <= the cache's n_pred)")
     p.add_argument("--min_area", type=int, default=6)
     p.add_argument("--region", type=float, nargs=3, default=None, metavar=("X", "Y", "R"))
+    p.add_argument("--k", type=int, default=0, help="prior rollouts per window: does the model IMAGINE the start?")
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out_dir", default=None)
@@ -180,6 +216,9 @@ def main():
             sig, kl = posterior_track(m, b, n, H)                                       # (B, H, 8, 8)
             up = lambda x: x.repeat_interleave(8, -1).repeat_interleave(8, -2)            # -> (B, H, 64, 64)
             sig, kl = up(sig), up(kl)
+            if a.k:
+                from ladder import scheduled_rollout
+                gs = torch.stack([scheduled_rollout(m, b, n, H, lambda q: "prior") for _ in range(a.k)], 1)
             green, pose = b["images"][:, :, GREEN].float(), b["ego_state"][..., :3]
             for bi in range(len(items)):
                 for u in stopped_users(green[bi], pose[bi], n, a.n_future, rc, a.min_area):
@@ -198,6 +237,12 @@ def main():
                         f = u["fp"][k]
                         r[f"sig_{k}"] = float(sig[bi, k][f].mean()) if f.any() else np.nan
                         r[f"kl_{k}"] = float(kl[bi, k][f].mean()) if f.any() else np.nan
+                    if a.k:
+                        res = [sample_start(gs[bi, q], u) for q in range(a.k)]
+                        ks = [q for q, fd in res if q >= 0 and not fd]
+                        r.update(k_samples=a.k, p_start=len(ks) / a.k,
+                                 p_fade=sum(1 for q, fd in res if q >= 0 and fd) / a.k,
+                                 k_pred=float(np.mean(ks)) if ks else -1.0)
                     rows.append(r)
         d = pd.DataFrame(rows)
         print(f"\n{run}: {len(idx)} windows, horizon {H * 0.2:.1f} s, 'stays' = still there after "
