@@ -8,6 +8,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import numpy as np
 import torch
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from roundabout_wm.config import Config
 from roundabout_wm.models.world_model import WMConfig, WorldModel
 from roundabout_wm.render import world_to_ego_px
@@ -46,3 +49,22 @@ def test_maps_shapes_and_fixed_prior():
             assert sig.shape == kl.shape == (2, H, 8, 8) and (kl >= -1e-5).all()
             if kw.get("fixed_prior"):
                 assert torch.allclose(sig, torch.ones_like(sig))
+
+
+def test_script_occ_only_and_hotspots():
+    """End to end on the synthetic recording: --occ_only writes the _occ files and prints the hotspot list; the
+    road-user-only world map has no more samples than the all-cells one."""
+    import subprocess
+    import test_action_gain as tag
+    S = tag._setup()
+    out = os.path.join(S["root"], "unc")
+    base = [sys.executable, os.path.join(ROOT, "scripts", "uncertainty_map.py"), "--cache", S["cache"],
+            "--data_dir", S["raw"], "--ckpts", S["ck"], "--n_windows", "6", "--k", "2", "--batch", "3",
+            "--min_count", "1", "--out_dir", out]
+    env = dict(os.environ, PYTHONPATH=ROOT)
+    r_all = subprocess.run(base, capture_output=True, text=True, env=env, cwd=S["root"])
+    r_occ = subprocess.run(base + ["--occ_only"], capture_output=True, text=True, env=env, cwd=S["root"])
+    assert r_all.returncode == 0 and r_occ.returncode == 0, r_occ.stdout[-1500:] + r_occ.stderr[-1500:]
+    assert "hotspots (road-user cells" in r_occ.stdout and "sigma_p" in r_occ.stdout
+    a, o = np.load(os.path.join(out, "uncertainty_fake.npz")), np.load(os.path.join(out, "uncertainty_fake_occ.npz"))
+    assert 0 < o["count"].sum() < a["count"].sum()
