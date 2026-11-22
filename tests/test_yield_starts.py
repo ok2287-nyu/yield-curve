@@ -101,6 +101,31 @@ def test_sample_start_tells_driving_off_from_vanishing():
     assert sample_start(fut, us[0]) == (-1, False)
 
 
+def test_rollout_eps_and_flip_scopes():
+    """Swapping eps at step k changes nothing before k and something from k on; an empty 'its cells' mask leaves
+    the reference unchanged and 'elsewhere' then equals 'all'."""
+    from roundabout_wm.models.world_model import WMConfig, WorldModel
+    from yield_starts import flip_rollouts, rollout_eps
+    cfg = Config()
+    n, H = cfg.data.n_cond, 4
+    g = torch.Generator().manual_seed(0)
+    b = {"images": (torch.rand(2, n + 5, 3, 64, 64, generator=g) > 0.9).float(),
+         "actions": torch.randn(2, n + 4, 2, generator=g), "speed": torch.randn(2, n + 5, 1, generator=g)}
+    torch.manual_seed(0)
+    m = WorldModel(WMConfig(n_cond=n)).eval()
+    with torch.no_grad():
+        m.P_z.weight.normal_(0, 0.5)                                   # make z matter in an untrained model
+    e0 = torch.randn(H, 2, m.cfg.z_ch, 8, 8, generator=g)
+    e1 = e0.clone(); e1[2] = torch.randn(e1[2].shape, generator=g)
+    r0, r0b, r1 = rollout_eps(m, b, n, H, e0), rollout_eps(m, b, n, H, e0), rollout_eps(m, b, n, H, e1)
+    assert torch.equal(r0, r0b) and not m.training
+    assert torch.equal(r0[:, :2], r1[:, :2]) and (r0[:, 2:] - r1[:, 2:]).abs().max() > 1e-4
+    out = flip_rollouts(m, b, n, H, torch.zeros(2, H, 1, 8, 8, dtype=torch.bool), torch.Generator().manual_seed(1))
+    assert len(out) == 2 + 3 * H
+    for k in range(H):
+        assert torch.equal(out[("car", k)], out["ref"]) and torch.equal(out[("other", k)], out[("all", k)])
+
+
 def test_auroc():
     assert auroc([2, 3], [0, 1]) == 1.0 and auroc([0, 1], [2, 3]) == 0.0
     assert auroc([1, 1], [1, 1]) == 0.5 and np.isnan(auroc([], [1]))
@@ -125,12 +150,14 @@ def test_script_smoke():
     out = os.path.join(root, "ys")
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "yield_starts.py"), "--cache", cache,
                         "--data_dir", raw, "--ckpts", ck, "--n_windows", "40", "--batch", "4",
-                        "--region", "42", "-50", "10", "--out_dir", out, "--k", "2", "--masks", "2"],
+                        "--region", "42", "-50", "10", "--out_dir", out, "--k", "2", "--masks", "2", "--flip", "1"],
                        capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=ROOT), cwd=root)
     assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-1500:]
     assert "AUROC start_2s vs stays" in r.stdout and "aligned to the start" in r.stdout, r.stdout[-1500:]
     assert "imagined futures (2 prior samples each)" in r.stdout and "drive off" in r.stdout
     assert "dropout (2 masks" in r.stdout and "do the masks flag" in r.stdout
+    assert "single-latent flips" in r.stdout and "sum over steps" in r.stdout
     d = pd.read_csv(os.path.join(out, "yield_starts_fake.csv"))
     assert {"stays", "start_2s"} <= set(d.label) and d.p_start.between(0, 1).all()
+    assert d.flip_full.between(0, 1).all() and d.flip_car_0.between(0, 1).all()
     assert os.path.exists(os.path.join(out, "yield_starts.png"))
