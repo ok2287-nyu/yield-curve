@@ -37,6 +37,13 @@ Prints, per checkpoint:
     - with --masks M, M MC-dropout rollouts (the same prior noise, only the dropout mask differs): the same shares
       for the masks, how often the masks disagree, and (with --k) whether mask disagreement flags the road users on
       which the latent samples all agree and are wrong: can an epistemic penalty catch confident mistakes?
+    - with --flip R, the single-latent test: a reference rollout (noise e0), a full resample (e1), and for every
+      step k and scope (all cells / the stopped road users' cells within 4.5 m / every other cell) the reference with
+      ONLY that latent resampled from e1. Prints, per step and scope, the share of stopped road users whose go/wait
+      outcome flips, and writes flip_<run>.png (examples: reference vs flipped at 2 s, |difference|). Flips at step
+      1-2 = an early latent tips the decision and the state keeps it; flips spread thinly over steps, summing well
+      below the full resample = accumulated; flips from "elsewhere" = the decision depends on other cells (e.g. the
+      ring traffic), not on the car's own latent. Cells of nearby stopped road users share the "its cells" scope.
 Writes yield_starts_<run>.csv (one row per stopped road user) and yield_starts.png (sigma_p vs steps to start).
 No rounD images in the outputs. CPU is fine but slow; a GPU job is faster.
 """
@@ -52,6 +59,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 
 from roundabout_wm.config import Config
 from roundabout_wm.dataset import RounDWindows
@@ -125,6 +133,102 @@ def sample_start(g, u, moved=0.3, keep=0.6):
         if (g[k][f] < 0.5).float().mean() > moved:
             return k, float(g[k][u["near"][k]].sum()) < keep * u["mass0"]
     return -1, False
+
+
+@torch.no_grad()
+def rollout_eps(m, b, n, H, eps):
+    """Prior rollout with GIVEN standard-normal noise: z_k = mu_p(h_k) + sigma_p(h_k) * eps[k], eps (H, B, z_ch, 8, 8)
+    (the reparameterisation, so swapping eps[k] resamples exactly the latent of step k). Eval mode. -> (B, H, 64, 64)"""
+    imgs, act, spd = b["images"], b["actions"], b["speed"]
+    was = m.training
+    m.eval()
+    try:
+        e = m.encode(imgs[:, :n])
+        h, _ = m.warmup(e, act, spd)
+        prev = imgs[:, n - 1, GREEN:GREEN + 1]
+        out = []
+        for k in range(H):
+            i = n - 1 + k
+            frame = None
+            if m.cfg.reencode:
+                frame = imgs[:, i] if k == 0 else torch.cat([imgs[:, i, :GREEN], prev.to(imgs.dtype),
+                                                             imgs[:, i, GREEN + 1:]], 1)
+            mu, lv = m.prior_params(h)
+            h, prev = m.rollout_step(h, mu + (0.5 * lv).exp() * eps[k], act[:, i], spd[:, i], frame, prev)
+            out.append(prev[:, 0].float())
+    finally:
+        m.train(was)
+    return torch.stack(out, 1)
+
+
+SCOPES = ("all", "car", "other")
+
+
+def flip_rollouts(m, b, n, H, cellmask, gen):
+    """One reference rollout with noise e0, one full resample (e1 everywhere), and for every step k and scope
+    (all cells / the stopped road users' cells / every other cell) the reference with ONLY that step's z, in that
+    scope, resampled from e1. cellmask (B, H, 1, 8, 8) bool: cells within 4.5 m of a stopped road user at step k.
+    -> dict {"ref": g, "full": g, (scope, k): g}, each g (B, H, 64, 64)."""
+    B, C = b["images"].shape[0], m.cfg.z_ch
+    dev = b["images"].device
+    e0 = torch.randn((H, B, C, 8, 8), generator=gen, device=dev)
+    e1 = torch.randn((H, B, C, 8, 8), generator=gen, device=dev)
+    out = {"ref": rollout_eps(m, b, n, H, e0), "full": rollout_eps(m, b, n, H, e1)}
+    for k in range(H):
+        for sc in SCOPES:
+            e = e0.clone()
+            sel = torch.ones_like(cellmask[:, k]) if sc == "all" else (cellmask[:, k] if sc == "car" else ~cellmask[:, k])
+            e[k] = torch.where(sel, e1[k], e0[k])
+            out[(sc, k)] = rollout_eps(m, b, n, H, e)
+    return out
+
+
+def went(g, u):
+    k, faded = sample_start(g, u)
+    return k >= 0 and not faded
+
+
+def flip_report(d, H):
+    """Which single latent decides whether a stopped road user goes?"""
+    print(f"    single-latent flips ({int(d.n_flip.iloc[0])} reference/alternative draws per window): share of "
+          f"stopped road users whose go/wait outcome changes vs the reference")
+    print(f"      every latent resampled (all steps, all cells): {d.flip_full.mean():.3f}")
+    print(f"      {'step':>4s} {'all cells':>10s} {'its cells':>10s} {'elsewhere':>10s}")
+    for k in range(H):
+        print(f"      {k + 1:4d} " + " ".join(f"{d[f'flip_{sc}_{k}'].mean():10.3f}" for sc in SCOPES))
+    tot = {sc: sum(d[f"flip_{sc}_{k}"].mean() for k in range(H)) for sc in SCOPES}
+    print("      sum over steps: " + ", ".join(f"{sc} {v:.3f}" for sc, v in tot.items())
+          + "  (well below the full resample = no single step decides: accumulated)")
+    if "p_start" in d:
+        c = d[(d.p_start > 0) & (d.p_start < 1)]
+        if len(c):
+            print(f"      cars whose 8 samples split ({len(c)}): full {c.flip_full.mean():.3f}; by step, all cells: "
+                  + " ".join(f"{c[f'flip_all_{k}'].mean():.2f}" for k in range(H)))
+    return {"flip_full": float(d.flip_full.mean()), **{f"flip_sum_{sc}": v for sc, v in tot.items()}}
+
+
+def flip_sheet(ex, run, path):
+    """Examples where resampling ONE latent flipped go/wait: reference vs flipped at 2 s, and |difference|."""
+    if not ex:
+        return
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(len(ex), 3, figsize=(7.5, 2.5 * len(ex)), squeeze=False)
+    for i, (ref, flp, fp, lab) in enumerate(ex):
+        for j, (img, t, cm) in enumerate(((ref, "reference", "gray"), (flp, "one latent resampled", "gray"),
+                                          (np.abs(flp - ref), "|difference|", "magma"))):
+            ax = axes[i, j]
+            ax.imshow(img, cmap=cm, vmin=0, vmax=1)
+            ax.contour(fp, levels=[0.5], colors="c", linewidths=0.6)
+            ax.set_xticks([]); ax.set_yticks([])
+            if i == 0:
+                ax.set_title(t, fontsize=8)
+        axes[i, 0].set_ylabel(lab, fontsize=7)
+    fig.suptitle(f"{run}: one latent decides go / wait (green channel at 2 s; cyan = the stopped road user's spot; "
+                 f"ego forward is up)", fontsize=8)
+    fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
+    print(f"    wrote {path}")
 
 
 def auroc(pos, neg):
@@ -214,6 +318,8 @@ def main():
     p.add_argument("--region", type=float, nargs=3, default=None, metavar=("X", "Y", "R"))
     p.add_argument("--k", type=int, default=0, help="prior rollouts per window: does the model IMAGINE the start?")
     p.add_argument("--masks", type=int, default=0, help="MC-dropout rollouts per window (same prior noise, 0 = off)")
+    p.add_argument("--flip", type=int, default=0, help="single-latent resampling test: draws per window (0 = off)")
+    p.add_argument("--flip_sheet", type=int, default=8, help="flip examples drawn in flip_<run>.png")
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out_dir", default=None)
@@ -235,7 +341,7 @@ def main():
             print(f"\n{run}: no spatial latent, skipped"); continue
         ds = RounDWindows(a.cache, split, cfg, s["stats"], n_pred=cfg.data.n_pred)
         idx = np.sort(np.random.default_rng(a.seed).choice(len(ds), min(a.n_windows, len(ds)), replace=False))
-        rows = []
+        rows, flip_ex = [], []
         for j in range(0, len(idx), a.batch):
             items = [ds[int(i)] for i in idx[j:j + a.batch]]
             b = {key: torch.stack([it[key] for it in items]).to(dev) for key in items[0]}
@@ -249,8 +355,19 @@ def main():
             if a.masks:
                 gd = dropout_rollouts(m, b, n, H, a.masks).transpose(0, 1)               # (B, M, H, 64, 64)
             green, pose = b["images"][:, :, GREEN].float(), b["ego_state"][..., :3]
+            users = [[u for u in stopped_users(green[bi], pose[bi], n, a.n_future, rc, a.min_area)
+                      if u["start"] is not None] for bi in range(len(items))]
+            flips = []
+            if a.flip:
+                cellmask = torch.zeros(len(items), H, 1, 8, 8, dtype=torch.bool, device=dev)
+                for bi, us in enumerate(users):
+                    for u in us:
+                        cellmask[bi, :, 0] |= F.max_pool2d(u["near"][:H].float()[:, None], 8)[:, 0] > 0
+                gen = torch.Generator(device=dev).manual_seed(a.seed + j + 7)
+                if any(users):
+                    flips = [flip_rollouts(m, b, n, H, cellmask, gen) for _ in range(a.flip)]
             for bi in range(len(items)):
-                for u in stopped_users(green[bi], pose[bi], n, a.n_future, rc, a.min_area):
+                for u in users[bi]:
                     if u["start"] is None:
                         continue
                     k0 = u["start"]
@@ -277,6 +394,24 @@ def main():
                         r.update(n_masks=a.masks,
                                  p_mask=sum(1 for q, fd in res if q >= 0 and not fd) / a.masks,
                                  p_mask_fade=sum(1 for q, fd in res if q >= 0 and fd) / a.masks)
+                    if flips:
+                        r["n_flip"] = a.flip
+                        acc = {"full": 0.0, **{f"{sc}_{k}": 0.0 for sc in SCOPES for k in range(H)}}
+                        for fr in flips:
+                            w0 = went(fr["ref"][bi], u)
+                            acc["full"] += (went(fr["full"][bi], u) != w0) / a.flip
+                            for sc in SCOPES:
+                                for k in range(H):
+                                    f = went(fr[(sc, k)][bi], u) != w0
+                                    acc[f"{sc}_{k}"] += f / a.flip
+                                    if f and sc != "all" and len(flip_ex) < a.flip_sheet:
+                                        flip_ex.append((fr["ref"][bi, H - 1].cpu().numpy(),
+                                                        fr[(sc, k)][bi, H - 1].cpu().numpy(),
+                                                        u["fp"][H - 1].float().cpu().numpy(),
+                                                        f"win {int(idx[j + bi])}: step {k + 1}, "
+                                                        f"{'its cells' if sc == 'car' else 'elsewhere'}; "
+                                                        f"ref {'goes' if w0 else 'waits'}"))
+                        r.update({f"flip_{key}": v for key, v in acc.items()})
                     rows.append(r)
         d = pd.DataFrame(rows)
         print(f"\n{run}: {len(idx)} windows, horizon {H * 0.2:.1f} s, 'stays' = still there after "
@@ -285,6 +420,9 @@ def main():
             print("  no stopped road users found"); continue
         d.to_csv(os.path.join(out_dir, f"yield_starts_{run}.csv"), index=False)
         row = report(d, H, "all")
+        if "flip_full" in d:
+            row.update(flip_report(d, H))
+            flip_sheet(flip_ex, run, os.path.join(out_dir, f"flip_{run}.png"))
         s2 = d[d.label == "start_2s"]
         if len(s2):
             gx, gy = (s2.wx // 6 * 6 + 3).astype(int), (s2.wy // 6 * 6 + 3).astype(int)
