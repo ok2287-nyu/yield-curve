@@ -68,3 +68,54 @@ def test_script_occ_only_and_hotspots():
     assert "hotspots (road-user cells" in r_occ.stdout and "sigma_p" in r_occ.stdout
     a, o = np.load(os.path.join(out, "uncertainty_fake.npz")), np.load(os.path.join(out, "uncertainty_fake_occ.npz"))
     assert 0 < o["count"].sum() < a["count"].sum()
+
+
+def test_true_motion_zero_for_static_world_and_edge_keep():
+    """A world that only the ego moves through has ~0 motion; a road user that moves in the world does not."""
+    from uncertainty_map import edge_keep, true_motion
+    from roundabout_wm.wm_eval import warp_previous
+    cfg = Config()
+    n, H, rc = cfg.data.n_cond, 3, cfg.render
+    T = n + H
+    pose = torch.zeros(1, T, 4)
+    pose[0, :, 0] = torch.arange(T) * 2.0                                  # ego drives +x at 10 m/s
+    g0 = torch.zeros(1, 1, 64, 64)
+    g0[..., 20:24, 28:36] = 1.0                                            # a parked car ahead
+    imgs = torch.zeros(1, T, 3, 64, 64)
+    imgs[:, :, 1] = warp_previous(g0, pose[:, 0, :3], pose[..., :3], rc)[:, :, 0]
+    b = {"images": imgs, "ego_state": pose}
+    static = true_motion(b, n, H, rc)
+    moved = imgs.clone()
+    moved[0, n:, 1] = torch.roll(moved[0, n:, 1], 8, dims=-1)              # the car jumps sideways in the world
+    mov = true_motion({"images": moved, "ego_state": pose}, n, H, rc)
+    assert static.shape == (1, H, 8, 8) and static.max() < 0.05 and mov.max() > 4 * static.max()
+    keep = edge_keep(2, 3, 1).reshape(2, 3, 8, 8)
+    assert keep[:, :, 1:7, 1:7].all() and not keep[:, :, 0].any() and not keep[:, :, :, 7].any()
+    assert edge_keep(1, 1, 0).all()
+
+
+def test_script_edge_motion_fork():
+    import subprocess
+    import test_action_gain as tag
+    S = tag._setup()
+    out = os.path.join(S["root"], "unc2")
+    base = [sys.executable, os.path.join(ROOT, "scripts", "uncertainty_map.py"), "--cache", S["cache"],
+            "--data_dir", S["raw"], "--ckpts", S["ck"], "--n_windows", "6", "--k", "2", "--batch", "3",
+            "--min_count", "1", "--out_dir", out, "--occ_only"]
+    env = dict(os.environ, PYTHONPATH=ROOT)
+    r0 = subprocess.run(base, capture_output=True, text=True, env=env, cwd=S["root"])
+    assert r0.returncode == 0, r0.stderr[-1500:]
+    # find a road-user location from the hotspot list to aim the fork at
+    line = [l for l in r0.stdout.splitlines() if l.strip().startswith("sigma_p ") and "top:" in l][0]
+    x, y = (float(v) for v in line.split("top: (")[1].split(")")[0].split(","))
+    r = subprocess.run(base + ["--edge_cells", "1", "--motion_bins", "2", "--fork_xy", str(x), str(y),
+                               "--fork_r", "6", "--fork_n", "2", "--fork_k", "3"],
+                       capture_output=True, text=True, env=env, cwd=S["root"])
+    assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-2500:]
+    assert "border dropped" in r.stdout and "motion control" in r.stdout and "with motion taken out" in r.stdout
+    assert "fork / blur" in r.stdout and "centroid scatter" in r.stdout
+    e = np.load(os.path.join(out, "uncertainty_fake_occ_e1.npz"))
+    o = np.load(os.path.join(out, "uncertainty_fake_occ.npz"))
+    assert e["count"].sum() < o["count"].sum()
+    for f in ("uncertainty_fake_occ_e1_motion.png", "fork_fake_occ_e1.png"):
+        assert os.path.exists(os.path.join(out, f)), f
