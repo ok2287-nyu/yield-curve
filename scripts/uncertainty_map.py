@@ -22,6 +22,9 @@ Prints, per checkpoint:
       samples spread and where the model is wrong.
     - the same correlations within road-user cells only: every map is larger where a road user is, so this is the
       test of whether a map says WHICH road users are uncertain, not just where road users are.
+--occ_only: the world maps average only over cells that hold a road user in the true frame. Without it every map
+mostly shows WHERE TRAFFIC DRIVES (empty cells are certain and dilute the rest); with it, where on the roundabout
+the model is unsure ABOUT THE ROAD USERS. Also prints the --top world bins with the highest mean of each map.
 Writes, next to the first checkpoint unless --out_dir:
     uncertainty_<run>.png   the maps averaged in WORLD coordinates (3 m bins) over the roundabout photo
     uncertainty_<run>.npz   the world grids (sum, count) for each map
@@ -123,12 +126,15 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_corr", type=int, default=200000, help="cell-steps used for the correlations")
     p.add_argument("--out_dir", default=None)
+    p.add_argument("--occ_only", action="store_true", help="world maps over road-user cells only (files get _occ)")
+    p.add_argument("--top", type=int, default=8, help="print this many hotspot bins per map")
     a = p.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = Config()
     n, H, rc = cfg.data.n_cond, a.horizon, cfg.render
     split = json.load(open(os.path.join(a.cache, "split.json")))[a.split]
     out_dir = a.out_dir or os.path.dirname(os.path.abspath(a.ckpts[0]))
+    os.makedirs(out_dir, exist_ok=True)
     bg, bg_m = background(a.data_dir, split[0], cfg)
     nx, ny = int(bg.shape[1] * bg_m / a.bin) + 1, int(bg.shape[0] * bg_m / a.bin) + 1    # world x in [0, W], y in [-H, 0]
     stats = []
@@ -168,6 +174,8 @@ def main():
             gx = np.floor(xy[:, 0] / a.bin).astype(int)
             gy = np.floor(-xy[:, 1] / a.bin).astype(int)
             ok = (gx >= 0) & (gx < nx) & (gy >= 0) & (gy < ny)
+            if a.occ_only:
+                ok &= occ.cpu().numpy().reshape(-1)
             np.add.at(cnt, (gy[ok], gx[ok]), 1)
             for k in MAPS:
                 v = vals[k].reshape(-1)
@@ -213,12 +221,33 @@ def main():
                     if x < y:
                         row[f"rho_occ_{x}_{y}"] = corr_o.loc[x, y]
         stats.append(row)
-        np.savez(os.path.join(out_dir, f"uncertainty_{run}.npz"), count=cnt, bin=a.bin, bg_m_per_px=bg_m,
+        tag = "_occ" if a.occ_only else ""
+        np.savez(os.path.join(out_dir, f"uncertainty_{run}{tag}.npz"), count=cnt, bin=a.bin, bg_m_per_px=bg_m,
                  **{k: grid[k] for k in MAPS})
-        plot(run, grid, cnt, bg, bg_m, a, os.path.join(out_dir, f"uncertainty_{run}.png"))
+        plot(run, grid, cnt, bg, bg_m, a, os.path.join(out_dir, f"uncertainty_{run}{tag}.png"))
+        hotspots(grid, cnt, a)
     if stats:
         pd.DataFrame(stats).to_csv(os.path.join(out_dir, "uncertainty_stats.csv"), index=False)
         print(f"\nwrote uncertainty_<run>.png / .npz and uncertainty_stats.csv to {out_dir}")
+
+
+def hotspots(grid, cnt, a):
+    """Print the --top world bins (>= --min_count samples) with the highest mean of each map, with their world
+    position (m; x right, y up as in the background photo) and the bin's rank among all bins."""
+    seen = cnt >= a.min_count
+    where = "road-user cells" if a.occ_only else "all cells"
+    print(f"  hotspots ({where}, {a.bin:.0f} m bins with >= {a.min_count} samples, {seen.sum()} bins): "
+          f"x, y = bin centre in m, mean, n")
+    for k in MAPS:
+        mean = np.where(seen, grid[k] / np.maximum(cnt, 1), np.nan)
+        if not np.isfinite(mean).any():
+            continue
+        flat = np.argsort(np.nan_to_num(mean, nan=-np.inf).ravel())[::-1][:a.top]
+        ys, xs = np.unravel_index(flat, mean.shape)
+        med = np.nanmedian(mean)
+        cells = ", ".join(f"({(x + .5) * a.bin:.0f}, {-(y + .5) * a.bin:.0f}) {mean[y, x]:.3g} n{int(cnt[y, x])}"
+                          for y, x in zip(ys, xs))
+        print(f"    {k:8s} median bin {med:.3g} | top: {cells}")
 
 
 def plot(run, grid, cnt, bg, bg_m, a, path):
@@ -247,7 +276,8 @@ def plot(run, grid, cnt, bg, bg_m, a, path):
             ax.text(0.5, 0.5, "flat / not available", transform=ax.transAxes, ha="center")
         ax.set_xlim(zoom[0], zoom[1]); ax.set_ylim(zoom[2], zoom[3])
         ax.set_title(titles[k]); ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle(f"{run}: mean over {a.horizon} steps ({a.horizon * 0.2:.1f} s), world bins of {a.bin:.0f} m")
+    fig.suptitle(f"{run}: mean over {a.horizon} steps ({a.horizon * 0.2:.1f} s), world bins of {a.bin:.0f} m"
+                 + (", road-user cells only" if a.occ_only else ""))
     fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
 
 
