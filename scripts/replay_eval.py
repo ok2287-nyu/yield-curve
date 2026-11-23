@@ -2,7 +2,13 @@
 
     python scripts/replay_eval.py --cache ../round_cache --data_dir ../round_data --n_windows 300
 
-Policies (controllers will be added here):
+Model planners (controller/planner.py), one per checkpoint in --ckpts, named <kind>:<run>:
+    mpc        replan every 0.2 s: warm the model on the last 10 real frames, imagine 6 constant-acceleration plans
+               for 2 s (S prior samples x M dropout masks), apply the first action of the cheapest (cost.plan_costs)
+    mpc_warp   the same with the predict-then-warp baseline (warp_plan.warp_imagine, coast reference)
+               e.g. --policies human,coast --ckpts runs/ab_inv4_01/last.pt runs/ab_anchor/last.pt --planners mpc,mpc_warp
+Per episode the planners also report the share of steps each plan was picked and the imagined risk of the picks.
+Policies (constant / logged):
     human      the human's exact logged poses: the acceptance test. Expect no front / side collisions (rear and other
                overlaps would be labelling noise in rounD's boxes; their rate is the floor for every other policy)
     human_acc  the human's logged accelerations integrated along the path: the drift of the kinematic integration
@@ -32,13 +38,39 @@ POLICIES = {"human": HumanExact, "human_acc": HumanAccel, "brake": lambda: Const
 
 def summary(df, label):
     print(f"\n[{label}] {df.window.nunique()} windows")
-    print(f"  {'policy':10s} {'front':>6s} {'side':>6s} {'rear':>6s} {'gap<2m':>7s} {'minGap':>7s} {'hardBr':>7s} "
+    print(f"  {'policy':26s} {'front':>6s} {'side':>6s} {'rear':>6s} {'gap<2m':>7s} {'minGap':>7s} {'hardBr':>7s} "
           f"{'progr':>6s} {'lag s':>6s} {'freeze':>7s}")
     for name, g in df.groupby("policy", sort=False):
-        print(f"  {name:10s} {g.col_front.mean():6.3f} {g.col_side.mean():6.3f} {g.col_rear.mean():6.3f} "
+        print(f"  {name:26s} {g.col_front.mean():6.3f} {g.col_side.mean():6.3f} {g.col_rear.mean():6.3f} "
               f"{(g.min_gap < 2).mean():7.3f} {g.min_gap.replace(np.inf, np.nan).median():7.1f} "
               f"{(g.hard_brakes > 0).mean():7.3f} {g.progress.median():6.2f} {g.lag_s.median():6.2f} "
               f"{(g.freeze_s >= 1).mean():7.3f}")
+
+
+def load_planners(a, cfg):
+    """{<kind>:<run>: ModelPlanner} for every checkpoint in --ckpts and kind in --planners."""
+    if not a.ckpts:
+        return {}
+    import torch
+    from roundabout_wm.controller.cost import CostConfig
+    from roundabout_wm.controller.planner import ModelPlanner
+    from roundabout_wm.models.world_model import WMConfig, WorldModel
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    cc = CostConfig(w_prog=a.w_prog, **({} if a.w_epi is None else {"w_epi": a.w_epi}))
+    print(f"model planners: {cc.to_dict()}")
+    out = {}
+    for path in a.ckpts:
+        s = torch.load(path, map_location=dev)
+        m = WorldModel(WMConfig(**s["wm_cfg"])).to(dev).eval()
+        m.load_state_dict(s["model"])
+        run = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        for kind in a.planners.split(","):
+            if kind not in ("mpc", "mpc_warp"):
+                raise ValueError(f"unknown planner {kind}")
+            out[f"{kind}:{run}"] = ModelPlanner(m, s["stats"], cfg, cc=cc, T=a.plan_T, samples=a.samples, masks=a.masks,
+                                                seed=a.seed, warp_ref="coast" if kind == "mpc_warp" else None,
+                                                name=f"{kind}:{run}", device=dev)
+    return out
 
 
 def main():
@@ -53,16 +85,30 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="replay_eval.csv")
     p.add_argument("--reactive", action="store_true", help="road users react to the ego (ReplayEnv(reactive=True))")
+    p.add_argument("--ckpts", nargs="*", default=[], help="world models for the model planners")
+    p.add_argument("--planners", default="mpc", help="comma list of planner kinds: mpc, mpc_warp")
+    p.add_argument("--samples", type=int, default=4)
+    p.add_argument("--masks", type=int, default=4)
+    p.add_argument("--plan_T", type=int, default=10, help="planning horizon, steps (10 = 2 s)")
+    p.add_argument("--w_prog", type=float, default=0.5,
+                   help="planner progress weight (CostConfig default 0.2 makes coasting beat accelerating on an empty "
+                        "road; 0.5 = Nov 13 calibration: the plan cheapest on real futures then never crashes)")
+    p.add_argument("--w_epi", type=float, default=None, help="planner epistemic weight (default: CostConfig's)")
     a = p.parse_args()
     cfg = Config()
     split = json.load(open(os.path.join(a.cache, "split.json")))[a.split]
     env = ReplayEnv(a.cache, a.data_dir, split, cfg, horizon=a.horizon, reactive=a.reactive)
     idx = np.sort(np.random.default_rng(a.seed).choice(len(env.ds), min(a.n_windows, len(env.ds)), replace=False))
+    planners = load_planners(a, cfg)
+    names = [x for x in a.policies.split(",") if x] + list(planners)
     rows = []
     for j, i in enumerate(idx):
-        for name in a.policies.split(","):
-            pol = POLICIES[name]()
-            rows.append(dict(policy=name, **run_episode(env, pol, int(i))))
+        for name in names:
+            pol = planners[name] if name in planners else POLICIES[name]()
+            row = dict(policy=name, **run_episode(env, pol, int(i)))
+            if hasattr(pol, "episode_summary"):
+                row.update(pol.episode_summary())
+            rows.append(row)
         if (j + 1) % 25 == 0:
             print(f"  {j + 1}/{len(idx)} windows", end="\r")
     df = pd.DataFrame(rows)
@@ -70,6 +116,11 @@ def main():
     hum = df[df.policy == "human"].set_index("window")
     traffic = hum.index[hum.min_gap < a.near]
     summary(df, "all")
+    pick_cols = [c for c in df if c.startswith("pick_")]
+    if pick_cols:
+        print("\nmodel planners: share of steps each plan was picked; imagined risk of the picks (mean)")
+        print(df[df.policy.isin(list(planners))].groupby("policy", sort=False)[pick_cols + ["imagined_risk"]]
+              .mean().round(3).to_string())
     summary(df[df.window.isin(traffic)], f"traffic: human had a road user < {a.near:g} m ahead")
     bad = hum[hum.col_front | hum.col_side]
     if len(bad):
