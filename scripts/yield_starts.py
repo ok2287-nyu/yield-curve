@@ -43,8 +43,9 @@ Prints, per checkpoint:
       outcome flips, and writes flip_<run>.png (the flips with the largest change in how empty the car's spot is at 2 s, one per window:
       reference vs flipped, |difference|), and how big the flips are (a flip from 0.28 to 0.32 empty is a nudge
       across the threshold, not a decision). Flips at step
-      1-2 = an early latent tips the decision and the state keeps it; flips spread thinly over steps, summing well
-      below the full resample = accumulated; flips from "elsewhere" = the decision depends on other cells (e.g. the
+      1-2 = an early latent tips the decision and the state keeps it; one step's flips equal to
+      the full resample = that step decides; flips spread over steps summing to ~sqrt(steps) x the full resample =
+      accumulated; flips from "elsewhere" = the decision depends on other cells (e.g. the
       ring traffic), not on the car's own latent. Cells of nearby stopped road users share the "its cells" scope.
 Writes yield_starts_<run>.csv (one row per stopped road user) and yield_starts.png (sigma_p vs steps to start).
 No rounD images in the outputs. CPU is fine but slow; a GPU job is faster.
@@ -206,8 +207,13 @@ def flip_report(d, H):
     for k in range(H):
         print(f"      {k + 1:4d} " + " ".join(f"{d[f'flip_{sc}_{k}'].mean():10.3f}" for sc in SCOPES))
     tot = {sc: sum(d[f"flip_{sc}_{k}"].mean() for k in range(H)) for sc in SCOPES}
+    full = max(float(d.flip_full.mean()), 1e-9)
+    peak = int(np.argmax([d[f"flip_all_{k}"].mean() for k in range(H)])) + 1
     print("      sum over steps: " + ", ".join(f"{sc} {v:.3f}" for sc, v in tot.items())
-          + "  (well below the full resample = no single step decides: accumulated)")
+          + f"; sum / full resample = {tot['all'] / full:.1f}, peak at step {peak}")
+    print("      reading: one step decides -> its flips equal the full resample and the others are ~0 (ratio ~1); a\n"
+          "      threshold on a SUM of small per-step contributions -> flips spread over steps and the ratio is ~sqrt(steps)\n"
+          "      (> 1: one swap can tip it, swapping all tends to cancel); tipped early and kept -> peak at step 1-2")
     if "p_start" in d:
         c = d[(d.p_start > 0) & (d.p_start < 1)]
         if len(c):
