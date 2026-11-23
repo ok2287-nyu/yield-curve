@@ -78,6 +78,10 @@ def test_real_renders_parked_and_starting_cars():
     assert set(side) == {"left", "right"}, [u["start"] for u in us]
     assert side["left"]["start"] == -1
     assert side["right"]["start"] == 7
+    # a stricter 'started' (80 % of the spot empty, ~3.6 m) comes later: moved > 3.6 m after t = 4.6 s -> k = 9
+    us8 = stopped_users(green, pose, n, cfg.data.n_pred, rc, moved=0.8)
+    s8 = {("left" if u["mask"].nonzero()[:, 1].float().mean() < rc.ego_col else "right"): u for u in us8}
+    assert s8["left"]["start"] == -1 and s8["right"]["start"] in (8, 9)
 
 
 V_EGO = 6.0
@@ -157,6 +161,13 @@ def test_script_smoke():
     assert "imagined futures (2 prior samples each)" in r.stdout and "drive off" in r.stdout
     assert "dropout (2 masks" in r.stdout and "do the masks flag" in r.stdout
     assert "single-latent flips" in r.stdout and "sum over steps" in r.stdout
+    r8 = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "yield_starts.py"), "--cache", cache,
+                         "--data_dir", raw, "--ckpts", ck, "--n_windows", "40", "--batch", "4", "--out_dir", out,
+                         "--flip", "1", "--moved", "0.8"],
+                        capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=ROOT), cwd=root)
+    assert r8.returncode == 0, r8.stdout[-1500:] + r8.stderr[-1500:]
+    assert "more than 80% of its spot empty" in r8.stdout
+    assert os.path.exists(os.path.join(out, "yield_starts_fake_m0.8.csv"))
     d = pd.read_csv(os.path.join(out, "yield_starts_fake.csv"))
     assert {"stays", "start_2s"} <= set(d.label) and d.p_start.between(0, 1).all()
     assert d.flip_full.between(0, 1).all() and d.flip_car_0.between(0, 1).all()
