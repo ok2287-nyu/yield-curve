@@ -11,8 +11,8 @@ ranks those places right but widens only ~5 %. This is the direct test of the re
    border) whose green centroid moved < 0.5 px (0.375 m) since frames n-2 and n-3, once the ego's own motion is
    warped out: "stopped road users" (a road user creeping under ~0.9 m/s also counts).
 2. Each one's footprint (its pixels at n-1, fixed in the WORLD) is warped into every future frame n+k with the logged
-   ego poses. It has "started" at the first k where > 30 % of the footprint is no longer green (a car has moved
-   ~1.4 m: from a standstill that lags the true start by a few tenths of a second). Labels:
+   ego poses. It has "started" at the first k where > --moved (default 30 %) of the footprint is no longer green
+   (0.3: a car has moved ~1.4 m, so creeping forward in a queue counts; 0.8: about a car length). Labels:
        start_2s  starts within --horizon steps (default 10 = 2 s)
        start_4s  starts between 2 s and 4 s
        stays     still there after all --n_future steps (default 20 = 4 s)   (includes parked road users)
@@ -40,7 +40,9 @@ Prints, per checkpoint:
     - with --flip R, the single-latent test: a reference rollout (noise e0), a full resample (e1), and for every
       step k and scope (all cells / the stopped road users' cells within 4.5 m / every other cell) the reference with
       ONLY that latent resampled from e1. Prints, per step and scope, the share of stopped road users whose go/wait
-      outcome flips, and writes flip_<run>.png (examples: reference vs flipped at 2 s, |difference|). Flips at step
+      outcome flips, and writes flip_<run>.png (the flips with the largest change in how empty the car's spot is at 2 s, one per window:
+      reference vs flipped, |difference|), and how big the flips are (a flip from 0.28 to 0.32 empty is a nudge
+      across the threshold, not a decision). Flips at step
       1-2 = an early latent tips the decision and the state keeps it; flips spread thinly over steps, summing well
       below the full resample = accumulated; flips from "elsewhere" = the decision depends on other cells (e.g. the
       ring traffic), not on the car's own latent. Cells of nearby stopped road users share the "its cells" scope.
@@ -183,9 +185,16 @@ def flip_rollouts(m, b, n, H, cellmask, gen):
     return out
 
 
-def went(g, u):
-    k, faded = sample_start(g, u)
+def went(g, u, moved=0.3):
+    k, faded = sample_start(g, u, moved)
     return k >= 0 and not faded
+
+
+def empty_frac(g_last, u, H):
+    """Share of the road user's footprint (warped to the last step) that is empty in the frame g_last (64, 64):
+    the continuous quantity the 'drives off' threshold cuts (0 = still there, 1 = gone from its spot)."""
+    f = u["fp"][H - 1]
+    return float((g_last[f] < 0.5).float().mean()) if f.any() else float("nan")
 
 
 def flip_report(d, H):
@@ -319,7 +328,10 @@ def main():
     p.add_argument("--k", type=int, default=0, help="prior rollouts per window: does the model IMAGINE the start?")
     p.add_argument("--masks", type=int, default=0, help="MC-dropout rollouts per window (same prior noise, 0 = off)")
     p.add_argument("--flip", type=int, default=0, help="single-latent resampling test: draws per window (0 = off)")
-    p.add_argument("--flip_sheet", type=int, default=8, help="flip examples drawn in flip_<run>.png")
+    p.add_argument("--flip_sheet", type=int, default=8, help="flip examples drawn in flip_<run>.png (largest changes)")
+    p.add_argument("--moved", type=float, default=0.3,
+                   help="'started / drives off' = more than this share of the footprint empty (0.3 ~ 1.4 m of "
+                        "movement; ~0.8 ~ a car length). Applies to the true labels and to the imagined futures")
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out_dir", default=None)
@@ -341,7 +353,7 @@ def main():
             print(f"\n{run}: no spatial latent, skipped"); continue
         ds = RounDWindows(a.cache, split, cfg, s["stats"], n_pred=cfg.data.n_pred)
         idx = np.sort(np.random.default_rng(a.seed).choice(len(ds), min(a.n_windows, len(ds)), replace=False))
-        rows, flip_ex = [], []
+        rows, flip_cands, flip_gap = [], [], []
         for j in range(0, len(idx), a.batch):
             items = [ds[int(i)] for i in idx[j:j + a.batch]]
             b = {key: torch.stack([it[key] for it in items]).to(dev) for key in items[0]}
@@ -355,7 +367,8 @@ def main():
             if a.masks:
                 gd = dropout_rollouts(m, b, n, H, a.masks).transpose(0, 1)               # (B, M, H, 64, 64)
             green, pose = b["images"][:, :, GREEN].float(), b["ego_state"][..., :3]
-            users = [[u for u in stopped_users(green[bi], pose[bi], n, a.n_future, rc, a.min_area)
+            users = [[u for u in stopped_users(green[bi], pose[bi], n, a.n_future, rc, a.min_area,
+                                                  moved=a.moved)
                       if u["start"] is not None] for bi in range(len(items))]
             flips = []
             if a.flip:
@@ -384,13 +397,13 @@ def main():
                         r[f"sig_{k}"] = float(sig[bi, k][f].mean()) if f.any() else np.nan
                         r[f"kl_{k}"] = float(kl[bi, k][f].mean()) if f.any() else np.nan
                     if a.k:
-                        res = [sample_start(gs[bi, q], u) for q in range(a.k)]
+                        res = [sample_start(gs[bi, q], u, a.moved) for q in range(a.k)]
                         ks = [q for q, fd in res if q >= 0 and not fd]
                         r.update(k_samples=a.k, p_start=len(ks) / a.k,
                                  p_fade=sum(1 for q, fd in res if q >= 0 and fd) / a.k,
                                  k_pred=float(np.mean(ks)) if ks else -1.0)
                     if a.masks:
-                        res = [sample_start(gd[bi, q], u) for q in range(a.masks)]
+                        res = [sample_start(gd[bi, q], u, a.moved) for q in range(a.masks)]
                         r.update(n_masks=a.masks,
                                  p_mask=sum(1 for q, fd in res if q >= 0 and not fd) / a.masks,
                                  p_mask_fade=sum(1 for q, fd in res if q >= 0 and fd) / a.masks)
@@ -398,31 +411,50 @@ def main():
                         r["n_flip"] = a.flip
                         acc = {"full": 0.0, **{f"{sc}_{k}": 0.0 for sc in SCOPES for k in range(H)}}
                         for fr in flips:
-                            w0 = went(fr["ref"][bi], u)
-                            acc["full"] += (went(fr["full"][bi], u) != w0) / a.flip
+                            w0 = went(fr["ref"][bi], u, a.moved)
+                            e0 = empty_frac(fr["ref"][bi, H - 1], u, H)
+                            acc["full"] += (went(fr["full"][bi], u, a.moved) != w0) / a.flip
                             for sc in SCOPES:
                                 for k in range(H):
-                                    f = went(fr[(sc, k)][bi], u) != w0
+                                    f = went(fr[(sc, k)][bi], u, a.moved) != w0
                                     acc[f"{sc}_{k}"] += f / a.flip
-                                    if f and sc != "all" and len(flip_ex) < a.flip_sheet:
-                                        flip_ex.append((fr["ref"][bi, H - 1].cpu().numpy(),
-                                                        fr[(sc, k)][bi, H - 1].cpu().numpy(),
-                                                        u["fp"][H - 1].float().cpu().numpy(),
-                                                        f"win {int(idx[j + bi])}: step {k + 1}, "
-                                                        f"{'its cells' if sc == 'car' else 'elsewhere'}; "
-                                                        f"ref {'goes' if w0 else 'waits'}"))
+                                    if f:
+                                        e1 = empty_frac(fr[(sc, k)][bi, H - 1], u, H)
+                                        flip_gap.append(abs(e1 - e0))
+                                        if sc != "all":
+                                            flip_cands.append((abs(e1 - e0), int(idx[j + bi]), (
+                                                fr["ref"][bi, H - 1].cpu().numpy(),
+                                                fr[(sc, k)][bi, H - 1].cpu().numpy(),
+                                                u["fp"][H - 1].float().cpu().numpy(),
+                                                f"win {int(idx[j + bi])}: step {k + 1}, "
+                                                f"{'its cells' if sc == 'car' else 'elsewhere'}; ref "
+                                                f"{'goes' if w0 else 'waits'}; spot empty at 2 s: ref {e0:.2f}, "
+                                                f"resampled {e1:.2f}")))
+                                            flip_cands.sort(key=lambda c: -c[0])
+                                            seen, keep = set(), []
+                                            for c in flip_cands:              # largest changes, one per window
+                                                if c[1] not in seen:
+                                                    seen.add(c[1]); keep.append(c)
+                                            flip_cands[:] = keep[:a.flip_sheet]
                         r.update({f"flip_{key}": v for key, v in acc.items()})
                     rows.append(r)
         d = pd.DataFrame(rows)
         print(f"\n{run}: {len(idx)} windows, horizon {H * 0.2:.1f} s, 'stays' = still there after "
-              f"{a.n_future * 0.2:.1f} s")
+              f"{a.n_future * 0.2:.1f} s; 'starts' = more than {a.moved:.0%} of its spot empty")
         if d.empty:
             print("  no stopped road users found"); continue
-        d.to_csv(os.path.join(out_dir, f"yield_starts_{run}.csv"), index=False)
+        tag = "" if a.moved == 0.3 else f"_m{a.moved:g}"
+        d.to_csv(os.path.join(out_dir, f"yield_starts_{run}{tag}.csv"), index=False)
         row = report(d, H, "all")
         if "flip_full" in d:
             row.update(flip_report(d, H))
-            flip_sheet(flip_ex, run, os.path.join(out_dir, f"flip_{run}.png"))
+            if flip_gap:
+                g = np.array(flip_gap)
+                print(f"      how big are the flips? change in the share of the spot that is empty at 2 s, over all "
+                      f"{len(g)} flips: median {np.median(g):.2f}, p90 {np.percentile(g, 90):.2f}; share of flips with a "
+                      f"change > 0.5 (a real drive-off vs wait): {(g > 0.5).mean():.2f}")
+                row["flip_big_share"] = float((g > 0.5).mean())
+            flip_sheet([c[2] for c in flip_cands], run, os.path.join(out_dir, f"flip_{run}{tag}.png"))
         s2 = d[d.label == "start_2s"]
         if len(s2):
             gx, gy = (s2.wx // 6 * 6 + 3).astype(int), (s2.wy // 6 * 6 + 3).astype(int)
