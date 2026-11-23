@@ -427,7 +427,7 @@ def main():
                                     if f:
                                         e1 = empty_frac(fr[(sc, k)][bi, H - 1], u, H)
                                         flip_gap.append(abs(e1 - e0))
-                                        if sc != "all":
+                                        if sc != "all" and np.isfinite(e1 - e0):
                                             flip_cands.append((abs(e1 - e0), int(idx[j + bi]), (
                                                 fr["ref"][bi, H - 1].cpu().numpy(),
                                                 fr[(sc, k)][bi, H - 1].cpu().numpy(),
@@ -455,11 +455,14 @@ def main():
         if "flip_full" in d:
             row.update(flip_report(d, H))
             if flip_gap:
-                g = np.array(flip_gap)
-                print(f"      how big are the flips? change in the share of the spot that is empty at 2 s, over all "
-                      f"{len(g)} flips: median {np.median(g):.2f}, p90 {np.percentile(g, 90):.2f}; share of flips with a "
-                      f"change > 0.5 (a real drive-off vs wait): {(g > 0.5).mean():.2f}")
-                row["flip_big_share"] = float((g > 0.5).mean())
+                g0 = np.array(flip_gap)
+                g = g0[np.isfinite(g0)]                       # nan: the spot has left the view by 2 s
+                if len(g):
+                    print(f"      how big are the flips? change in the share of the spot that is empty at 2 s, over "
+                          f"{len(g)} flips ({len(g0) - len(g)} more with the spot out of view at 2 s): median "
+                          f"{np.median(g):.2f}, p90 {np.percentile(g, 90):.2f}; share of flips with a change > 0.5 "
+                          f"(a real drive-off vs wait): {(g > 0.5).mean():.2f}")
+                    row["flip_big_share"] = float((g > 0.5).mean())
             flip_sheet([c[2] for c in flip_cands], run, os.path.join(out_dir, f"flip_{run}{tag}.png"))
         s2 = d[d.label == "start_2s"]
         if len(s2):
