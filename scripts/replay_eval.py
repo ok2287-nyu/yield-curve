@@ -7,6 +7,7 @@ Model planners (controller/planner.py), one per checkpoint in --ckpts, named <ki
                for 2 s (S prior samples x M dropout masks), apply the first action of the cheapest (cost.plan_costs)
     mpc_warp   the same with the predict-then-warp baseline (warp_plan.warp_imagine, coast reference)
                e.g. --policies human,coast --ckpts runs/ab_inv4_01/last.pt runs/ab_anchor/last.pt --planners mpc,mpc_warp
+Learned policies (scripts/train_policy.py): --policy_ckpts runs/pol_v4/best.pt ..., named pol:<run>.
 Per episode the planners also report the share of steps each plan was picked and the imagined risk of the picks.
 Policies (constant / logged):
     human      the human's exact logged poses: the acceptance test. Expect no front / side collisions (rear and other
@@ -73,6 +74,27 @@ def load_planners(a, cfg):
     return out
 
 
+def load_policies(a, cfg):
+    """{pol:<run>: LearnedPolicy} for every checkpoint in --policy_ckpts (each names its world model)."""
+    if not a.policy_ckpts:
+        return {}
+    import torch
+    from roundabout_wm.controller.policy import LearnedPolicy, PolicyNet
+    from roundabout_wm.models.world_model import WMConfig, WorldModel
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    out = {}
+    for path in a.policy_ckpts:
+        ps = torch.load(path, map_location=dev)
+        s = torch.load(ps["wm"], map_location=dev)
+        m = WorldModel(WMConfig(**s["wm_cfg"])).to(dev).eval()
+        m.load_state_dict(s["model"])
+        pi = PolicyNet(hidden=m.cfg.hidden).to(dev)
+        pi.load_state_dict(ps["policy"])
+        run = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        out[f"pol:{run}"] = LearnedPolicy(m, pi, s["stats"], cfg, name=f"pol:{run}", device=dev)
+    return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cache", required=True)
@@ -94,12 +116,13 @@ def main():
                    help="planner progress weight (CostConfig default 0.2 makes coasting beat accelerating on an empty "
                         "road; 0.5 = Nov 13 calibration: the plan cheapest on real futures then never crashes)")
     p.add_argument("--w_epi", type=float, default=None, help="planner epistemic weight (default: CostConfig's)")
+    p.add_argument("--policy_ckpts", nargs="*", default=[], help="learned policies (train_policy.py), named pol:<run>")
     a = p.parse_args()
     cfg = Config()
     split = json.load(open(os.path.join(a.cache, "split.json")))[a.split]
     env = ReplayEnv(a.cache, a.data_dir, split, cfg, horizon=a.horizon, reactive=a.reactive)
     idx = np.sort(np.random.default_rng(a.seed).choice(len(env.ds), min(a.n_windows, len(env.ds)), replace=False))
-    planners = load_planners(a, cfg)
+    planners = {**load_planners(a, cfg), **load_policies(a, cfg)}
     names = [x for x in a.policies.split(",") if x] + list(planners)
     rows = []
     for j, i in enumerate(idx):
