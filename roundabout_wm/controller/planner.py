@@ -42,6 +42,8 @@ class ModelPlanner:
         self.a_mean = np.asarray(stats["action_mean"], dtype=np.float64)
         self.a_std = np.asarray(stats["action_std"], dtype=np.float64)
         self.picks, self.risks = Counter(), []
+        self.trace = []                  # per decision: the uncertainty signals of the picked plan (record_trace)
+        self.record_trace = False
 
     # ---- buffers of what the ego has really seen and done --------------------------------------------------------
     def reset(self, env):
@@ -95,6 +97,10 @@ class ModelPlanner:
             out = imagine(self.m, h, paths, self.stats, self.cfg, self.S, self.M, seed=seed, prev0=prev)
         cm = plan_costs(out["green"], out["speed"], out["acc"], out["curv"], self.cfg.render, self.cc,
                         acc_prev=self.acc_prev)
+        if self.record_trace:
+            g = out["green"].float()                                         # (M, S, P, T, 64, 64)
+            cm["epi_pix"] = (g.var(0, unbiased=True).sum((-1, -2)).mean((0, 2)) if g.shape[0] > 1
+                             else torch.zeros_like(cm["risk"]))              # PPUU: pixel variance over masks
         return paths, cm
 
     def act(self, env, obs):
@@ -105,6 +111,11 @@ class ModelPlanner:
         a = float(paths["acc"][best, 0])
         self.picks[self.names[best]] += 1
         self.risks.append(float(cm["risk"][best]))
+        if self.record_trace:
+            self.trace.append(dict(window=int(self.window), t=int(obs["t"]), pick=self.names[best],
+                                   epi=float(cm["epistemic"][best]), epi_mean=float(cm["epistemic"].mean()),
+                                   epi_pix=float(cm["epi_pix"][best]), epi_pix_mean=float(cm["epi_pix"].mean()),
+                                   risk=float(cm["risk"][best]), risk_mean=float(cm["risk"].mean())))
         self.acc_prev = a
         return a
 
