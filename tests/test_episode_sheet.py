@@ -46,3 +46,9 @@ def test_sheet_end_to_end():
                             "--split", "test", "--out", out], capture_output=True, text=True, env=env, cwd=root)
         assert s.returncode == 0, s.stdout[-1000:] + s.stderr[-2500:]
         assert os.path.exists(out), s.stdout
+    w = int(d[d.policy == "coast"].window.iloc[0])
+    out = os.path.join(root, "chosen.png")
+    s = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "episode_sheet.py"), "--cache", cache,
+                        "--data_dir", raw, "--csv", csv, "--controller", "coast", "--windows", str(w), "--split", "test",
+                        "--out", out], capture_output=True, text=True, env=env, cwd=root)
+    assert s.returncode == 0 and os.path.exists(out), s.stdout[-1000:] + s.stderr[-2500:]
