@@ -7,6 +7,7 @@
     # windows where it drives differently from the human without colliding (half slower, half faster)
     ... --select differ --n 8 --out runs/planner_eval/sheets/pol_v4_differ.png
     # planners: --controller mpc:ab_inv4_01 --ckpts runs/ab_inv4_01/last.pt --planners mpc ; constants: --controller coast
+    # chosen windows: ... --windows 9570 14494 --out runs/planner_eval/sheets/chosen.png
 
 Each row is one window, rerun in ReplayEnv (the same seeds as replay_eval, so the same episode):
     - panels at --times (s): the road photo, the logged road users (grey boxes; dots for road users without a size),
@@ -92,6 +93,8 @@ def main():
     p.add_argument("--controller", required=True, help="policy name in the CSV, e.g. pol:pol_v4, mpc:ab_inv4_01")
     p.add_argument("--select", choices=("crash", "differ"), default="crash")
     p.add_argument("--n", type=int, default=8)
+    p.add_argument("--windows", type=int, nargs="*", default=None,
+                   help="draw exactly these windows (from the CSV's window column) instead of --select")
     p.add_argument("--times", default="0,1.5,3,4.5,6", help="seconds into the episode")
     p.add_argument("--split", default="val")
     p.add_argument("--horizon", type=int, default=30)
@@ -108,7 +111,13 @@ def main():
     a = p.parse_args()
     cfg = Config()
     dt = cfg.data.dt
-    rows = select(pd.read_csv(a.csv), a.controller, a.select, a.n)
+    df = pd.read_csv(a.csv)
+    if a.windows:
+        rows = df[(df.policy == a.controller) & df.window.isin(a.windows)]
+        rows = rows.set_index("window").loc[[w for w in a.windows if w in set(rows.window)]].reset_index()
+        a.select = "chosen"
+    else:
+        rows = select(df, a.controller, a.select, a.n)
     if rows.empty:
         print(f"no {a.select} windows for {a.controller}")
         return
@@ -155,7 +164,9 @@ def main():
             ax.set_xticks([]); ax.set_yticks([])
             ax.set_title(f"{t * dt:.1f} s" + ("  (ended)" if t < round(ts / dt) else ""), fontsize=8)
         lab = (f"win {int(r.window)} rec {int(r.rec)}\n" + (f"hit at {t_hit * dt:.1f} s" if t_hit is not None
-                                                             else f"lag {r.lag_s:+.1f} s, prog {r.progress:.2f}"))
+                                                             else f"lag {r.lag_s:+.1f} s, prog {r.progress:.2f}")
+               + (f"\nacc: human {(path.speed[min(T, len(path.speed) - 1)] - path.speed[0]) / max(T, 1) / dt:+.2f}, "
+                  f"ctrl {np.nanmean(L.acc.to_numpy()[1:]):+.2f}" if T > 0 else ""))
         axes[i, 0].set_ylabel(lab, fontsize=7)
         ax = axes[i, K]
         tt = L.t.to_numpy() * dt
