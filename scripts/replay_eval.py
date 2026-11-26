@@ -59,7 +59,9 @@ def load_planners(a, cfg):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     extra = {k: v for k, v in (("w_epi", a.w_epi), ("epi_thresh", getattr(a, "epi_thresh", None))) if v is not None}
     cc = CostConfig(w_prog=a.w_prog, **extra)
-    tag = "" if not extra else "@" + ",".join(f"{k}={v:g}" for k, v in extra.items())   # distinguishes variants
+    fb = getattr(a, "fallback_thresh", None)
+    named = {**extra, **({"fallback": fb} if fb is not None else {})}
+    tag = "" if not named else "@" + ",".join(f"{k}={v:g}" for k, v in named.items())   # distinguishes variants
     print(f"model planners: {cc.to_dict()}")
     out = {}
     for path in a.ckpts:
@@ -72,7 +74,7 @@ def load_planners(a, cfg):
                 raise ValueError(f"unknown planner {kind}")
             out[f"{kind}:{run}{tag}"] = ModelPlanner(m, s["stats"], cfg, cc=cc, T=a.plan_T, samples=a.samples, masks=a.masks,
                                                 seed=a.seed, warp_ref="coast" if kind == "mpc_warp" else None,
-                                                name=f"{kind}:{run}", device=dev)
+                                                name=f"{kind}:{run}", device=dev, fallback=fb)
     return out
 
 
@@ -123,6 +125,9 @@ def main():
                         "(CostConfig default 0). With either set, planner names get a suffix, e.g. "
                         "mpc:ab_inv4_01@w_epi=10,epi_thresh=0.1")
     p.add_argument("--policy_ckpts", nargs="*", default=[], help="learned policies (train_policy.py), named pol:<run>")
+    p.add_argument("--fallback_thresh", type=float, default=None,
+                   help="planner fallback: when the cheapest plan's epistemic term exceeds this, take the plan with the "
+                        "lowest imagined risk instead (name suffix @fallback=<value>)")
     a = p.parse_args()
     cfg = Config()
     split = json.load(open(os.path.join(a.cache, "split.json")))[a.split]
@@ -148,7 +153,8 @@ def main():
     pick_cols = [c for c in df if c.startswith("pick_")]
     if pick_cols:
         print("\nmodel planners: share of steps each plan was picked; imagined risk of the picks (mean)")
-        print(df[df.policy.isin(list(planners))].groupby("policy", sort=False)[pick_cols + ["imagined_risk"]]
+        extra_cols = [c for c in ("fallback_share",) if c in df]
+        print(df[df.policy.isin(list(planners))].groupby("policy", sort=False)[pick_cols + ["imagined_risk"] + extra_cols]
               .mean().round(3).to_string())
     summary(df[df.window.isin(traffic)], f"traffic: human had a road user < {a.near:g} m ahead")
     bad = hum[hum.col_front | hum.col_side]

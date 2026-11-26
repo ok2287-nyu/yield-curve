@@ -118,3 +118,35 @@ def test_episode_and_replay_eval_smoke():
                         env=dict(os.environ, PYTHONPATH=ROOT), cwd=S["root"])
     assert r2.returncode == 0, r2.stdout[-1500:] + r2.stderr[-2500:]
     assert "mpc:fake@w_epi=10,epi_thresh=0.1" in r2.stdout and "'epi_thresh': 0.1" in r2.stdout
+
+
+def test_fallback_takes_the_lowest_risk_plan_when_the_pick_is_uncertain(monkeypatch):
+    """Costs replaced: 'go' is cheapest but uncertain (epistemic 0.5), 'brake' has the lowest risk. No fallback ->
+    go; fallback 0.1 -> brake (counted); fallback 1.0 -> go."""
+    S = _setup()
+    env, cfg = S["env"], S["cfg"]
+    names = ["brake", "gentle", "coast", "nudge", "go", "hold"]
+
+    def fake_imagine(m, h, paths, *a, **k):
+        P, T = paths["acc"].shape
+        return {"green": torch.zeros(1, 1, P, T, 64, 64), "speed": paths["state"][:, :, 3], "acc": paths["acc"],
+                "curv": paths["curv"]}
+
+    def fake_costs(*a, **k):
+        return {"total": torch.tensor([5., 4, 3, 2, 1, 6]), "risk": torch.tensor([0.1, 1, 1, 1, 1, 1]),
+                "epistemic": torch.tensor([0., 0, 0, 0, 0.5, 0])}
+
+    monkeypatch.setattr(planner_mod, "imagine", fake_imagine)
+    monkeypatch.setattr(planner_mod, "plan_costs", fake_costs)
+    for fb, want in ((None, "go"), (0.1, "brake"), (1.0, "go")):
+        pol = ModelPlanner(S["m"], S["stats"], cfg, samples=1, masks=1, fallback=fb)
+        pol.record_trace = True
+        obs = env.reset(S["w"])
+        pol.reset(env)
+        pol.act(env, obs)
+        assert pol.trace[-1]["pick"] == want and pol.names == names
+        assert pol.trace[-1]["epi_go"] == 0.5 and abs(pol.trace[-1]["risk_brake"] - 0.1) < 1e-6
+        summ = pol.episode_summary()
+        assert ("fallback_share" in summ) == (fb is not None)
+        if fb is not None:
+            assert summ["fallback_share"] == (1.0 if want == "brake" else 0.0)
