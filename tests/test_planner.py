@@ -111,3 +111,10 @@ def test_episode_and_replay_eval_smoke():
                        cwd=S["root"])
     assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-2500:]
     assert "mpc:fake" in r.stdout and "mpc_warp:fake" in r.stdout and "imagined risk" in r.stdout
+    r2 = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "replay_eval.py"), "--cache", S["cache"],
+                         "--data_dir", S["raw"], "--n_windows", "2", "--horizon", "3", "--policies", "human",
+                         "--ckpts", S["ck"], "--planners", "mpc", "--samples", "1", "--masks", "2", "--w_epi", "10",
+                         "--epi_thresh", "0.1", "--out", out], capture_output=True, text=True,
+                        env=dict(os.environ, PYTHONPATH=ROOT), cwd=S["root"])
+    assert r2.returncode == 0, r2.stdout[-1500:] + r2.stderr[-2500:]
+    assert "mpc:fake@w_epi=10,epi_thresh=0.1" in r2.stdout and "'epi_thresh': 0.1" in r2.stdout
