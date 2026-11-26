@@ -30,11 +30,15 @@ PLAN_ACC = {"brake": -3.0, "gentle": -1.5, "coast": 0.0, "nudge": 0.75, "go": 1.
 
 class ModelPlanner:
     def __init__(self, model, stats, cfg, cc: CostConfig | None = None, plans=PLAN_ACC, hold=True, T=10, samples=4,
-                 masks=4, seed=0, warp_ref=None, name="mpc", device=None):
+                 masks=4, seed=0, warp_ref=None, name="mpc", device=None, fallback=None):
         self.m, self.stats, self.cfg = model.eval(), stats, cfg
         self.cc = cc or CostConfig()
         self.plans, self.hold, self.T, self.S, self.M = dict(plans), hold, T, samples, masks
         self.seed, self.warp_ref, self.name = seed, warp_ref, name
+        # fallback: if the cheapest plan's epistemic term exceeds this, take the plan with the lowest imagined risk
+        # (ignoring progress, comfort and the epistemic penalty) instead
+        self.fallback = fallback
+        self.n_fallback = 0
         self.dev = device or next(model.parameters()).device
         self.names = list(self.plans) + (["hold"] if hold else [])
         if warp_ref and "coast" not in self.names:
@@ -108,6 +112,10 @@ class ModelPlanner:
             self._observe(obs)
         paths, cm = self.score(obs)
         best = int(torch.argmin(cm["total"]))
+        fell = self.fallback is not None and float(cm["epistemic"][best]) > self.fallback
+        if fell:
+            best = int(torch.argmin(cm["risk"]))
+            self.n_fallback += 1
         a = float(paths["acc"][best, 0])
         self.picks[self.names[best]] += 1
         self.risks.append(float(cm["risk"][best]))
@@ -115,7 +123,9 @@ class ModelPlanner:
             self.trace.append(dict(window=int(self.window), t=int(obs["t"]), pick=self.names[best],
                                    epi=float(cm["epistemic"][best]), epi_mean=float(cm["epistemic"].mean()),
                                    epi_pix=float(cm["epi_pix"][best]), epi_pix_mean=float(cm["epi_pix"].mean()),
-                                   risk=float(cm["risk"][best]), risk_mean=float(cm["risk"].mean())))
+                                   risk=float(cm["risk"][best]), risk_mean=float(cm["risk"].mean()), fallback=fell,
+                                   **{f"epi_{n}": float(cm["epistemic"][i]) for i, n in enumerate(self.names)},
+                                   **{f"risk_{n}": float(cm["risk"][i]) for i, n in enumerate(self.names)}))
         self.acc_prev = a
         return a
 
@@ -124,10 +134,12 @@ class ModelPlanner:
         tot = max(sum(self.picks.values()), 1)
         out = {f"pick_{k}": self.picks.get(k, 0) / tot for k in self.names}
         out["imagined_risk"] = float(np.mean(self.risks)) if self.risks else np.nan
+        if self.fallback is not None:
+            out["fallback_share"] = self.n_fallback / tot
         return out
 
     def episode_summary(self):
         """summary() of the last episode only, then cleared (one row per episode in replay_eval)."""
         out = self.summary()
-        self.picks, self.risks = Counter(), []
+        self.picks, self.risks, self.n_fallback = Counter(), [], 0
         return out
