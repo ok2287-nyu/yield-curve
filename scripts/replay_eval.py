@@ -57,7 +57,9 @@ def load_planners(a, cfg):
     from roundabout_wm.controller.planner import ModelPlanner
     from roundabout_wm.models.world_model import WMConfig, WorldModel
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    cc = CostConfig(w_prog=a.w_prog, **({} if a.w_epi is None else {"w_epi": a.w_epi}))
+    extra = {k: v for k, v in (("w_epi", a.w_epi), ("epi_thresh", getattr(a, "epi_thresh", None))) if v is not None}
+    cc = CostConfig(w_prog=a.w_prog, **extra)
+    tag = "" if not extra else "@" + ",".join(f"{k}={v:g}" for k, v in extra.items())   # distinguishes variants
     print(f"model planners: {cc.to_dict()}")
     out = {}
     for path in a.ckpts:
@@ -68,7 +70,7 @@ def load_planners(a, cfg):
         for kind in a.planners.split(","):
             if kind not in ("mpc", "mpc_warp"):
                 raise ValueError(f"unknown planner {kind}")
-            out[f"{kind}:{run}"] = ModelPlanner(m, s["stats"], cfg, cc=cc, T=a.plan_T, samples=a.samples, masks=a.masks,
+            out[f"{kind}:{run}{tag}"] = ModelPlanner(m, s["stats"], cfg, cc=cc, T=a.plan_T, samples=a.samples, masks=a.masks,
                                                 seed=a.seed, warp_ref="coast" if kind == "mpc_warp" else None,
                                                 name=f"{kind}:{run}", device=dev)
     return out
@@ -116,6 +118,10 @@ def main():
                    help="planner progress weight (CostConfig default 0.2 makes coasting beat accelerating on an empty "
                         "road; 0.5 = Nov 13 calibration: the plan cheapest on real futures then never crashes)")
     p.add_argument("--w_epi", type=float, default=None, help="planner epistemic weight (default: CostConfig's)")
+    p.add_argument("--epi_thresh", type=float, default=None,
+                   help="planner epistemic threshold: only std over masks of a plan's risk above it is penalised "
+                        "(CostConfig default 0). With either set, planner names get a suffix, e.g. "
+                        "mpc:ab_inv4_01@w_epi=10,epi_thresh=0.1")
     p.add_argument("--policy_ckpts", nargs="*", default=[], help="learned policies (train_policy.py), named pol:<run>")
     a = p.parse_args()
     cfg = Config()
