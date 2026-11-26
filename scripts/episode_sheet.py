@@ -146,6 +146,7 @@ def main():
         T = int(L.t.iloc[-1])
         hit = L[L.hits.apply(len) > 0]
         t_hit = int(hit.t.iloc[0]) if len(hit) else None
+        hit_cls = "/".join(sorted({c for _, c in hit.hits.iloc[0]})) if len(hit) else ""
         for j, ts in enumerate(times):
             ax = axes[i, j]
             t = min(int(round(ts / dt)), T)
@@ -163,7 +164,7 @@ def main():
             ax.set_xlim(mx - 30, mx + 30); ax.set_ylim(my - 30, my + 30)
             ax.set_xticks([]); ax.set_yticks([])
             ax.set_title(f"{t * dt:.1f} s" + ("  (ended)" if t < round(ts / dt) else ""), fontsize=8)
-        lab = (f"win {int(r.window)} rec {int(r.rec)}\n" + (f"hit at {t_hit * dt:.1f} s" if t_hit is not None
+        lab = (f"win {int(r.window)} rec {int(r.rec)}\n" + (f"{hit_cls} hit at {t_hit * dt:.1f} s" if t_hit is not None
                                                              else f"lag {r.lag_s:+.1f} s, prog {r.progress:.2f}")
                + (f"\nacc: human {(path.speed[min(T, len(path.speed) - 1)] - path.speed[0]) / max(T, 1) / dt:+.2f}, "
                   f"ctrl {np.nanmean(L.acc.to_numpy()[1:]):+.2f}" if T > 0 else ""))
