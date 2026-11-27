@@ -56,3 +56,15 @@ def test_planner_trace_and_script_smoke():
                        capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=ROOT), cwd=S["root"])
     assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-2500:]
     assert "== mpc:fake" in r.stdout and os.path.exists(out) and os.path.exists(out.replace(".csv", "_episodes.csv"))
+
+
+def test_fallback_match_fires_on_the_same_share():
+    import pandas as pd
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    from fallback_match import match
+    rng = np.random.default_rng(0)
+    risk = rng.exponential(1.0, 10000)
+    d = pd.DataFrame({"risk": risk, "epi": 0.05 * risk + rng.normal(0, 0.02, 10000)})
+    share, thr, ov = match(d, 0.1)
+    assert abs((d.risk > thr).mean() - share) < 0.002 and 0 < share < 0.5
+    assert 0.5 < ov <= 1.0                                    # correlated triggers mostly agree
