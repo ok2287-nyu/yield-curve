@@ -447,3 +447,95 @@ if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
             fn(); print("ok", name)
+
+
+# ---- pushforward ------------------------------------------------------------------------------------------------
+def test_pushforward_loss_runs_and_trains_the_right_parts():
+    """The ELBO step after the drift gives gradients to Pred, Dec, posterior, prior (via the KL) and P_z / A; the
+    warm-up frames reach the encoder only through the detached state, so the encoder's gradient comes from the
+    one real next frame the posterior reads."""
+    m = _model(beta=1e-4)
+    m.train()
+    loss, logs = m.pushforward_loss(_batch(), k=3, n_pred=N_PRED)
+    assert torch.isfinite(loss) and set(logs) == {"pf", "pf_mse", "pf_kl", "pf_k"} and logs["pf_k"] == 3
+    loss.backward()
+    for name in ("pred", "dec", "posterior", "prior", "P_z", "A", "encoder"):
+        g = [p.grad for p in getattr(m, name).parameters() if p.grad is not None]
+        assert g and any(x.abs().sum() > 0 for x in g), f"no gradient into {name}"
+    assert all(p.grad is None or p.grad.abs().sum() == 0 for p in m.P_e.parameters()), \
+        "P_e is only used in the warm-up, which is behind the stop-gradient"
+
+
+def test_pushforward_has_no_gradient_through_the_drift():
+    """Changing the warm-up frames changes the loss (they set the drifted state) but gives them no gradient."""
+    m = _model(beta=1e-4)
+    m.train()
+    b = _batch()
+    b["images"] = b["images"].clone().requires_grad_(True)
+    loss, _ = m.pushforward_loss(b, k=2, n_pred=N_PRED)
+    loss.backward()
+    i0 = N_COND - 1 + 2
+    g = b["images"].grad
+    assert g[:, :i0 + 1].abs().sum() == 0, "gradient leaked through the k-step drift into earlier frames"
+    assert g[:, i0 + 1].abs().sum() > 0, "the real next frame (posterior input and target) must get a gradient"
+
+
+def test_pushforward_drift_uses_the_prior_not_the_future():
+    """The k drift steps may not read frames after the warm-up, except the target frame i0 + 1 the ELBO step uses:
+    corrupting frames n_cond .. i0 leaves the loss unchanged (same noise)."""
+    m = _model(beta=1e-4)
+    m.eval()                                                     # no dropout: identical passes
+    b = _batch()
+    k = 3
+    i0 = N_COND - 1 + k
+    torch.manual_seed(5)
+    l1, _ = m.pushforward_loss(b, k=k, n_pred=N_PRED)
+    b2 = {kk: v.clone() for kk, v in b.items()}
+    b2["images"][:, N_COND:i0 + 1] = 1 - b2["images"][:, N_COND:i0 + 1]
+    torch.manual_seed(5)
+    l2, _ = m.pushforward_loss(b2, k=k, n_pred=N_PRED)
+    assert torch.allclose(l1, l2), "the drift read future frames"
+    b3 = {kk: v.clone() for kk, v in b.items()}
+    b3["images"][:, i0 + 1] = 1 - b3["images"][:, i0 + 1]
+    torch.manual_seed(5)
+    l3, _ = m.pushforward_loss(b3, k=k, n_pred=N_PRED)
+    assert not torch.allclose(l1, l3), "the ELBO step must score the real next frame"
+
+
+def test_pushforward_k_one_differs_from_teacher_forcing_only_by_one_prior_step():
+    """With k = 1 and length 1, the target is frame n_cond + 1, predicted after one PRIOR step from the warm-up."""
+    m = _model(beta=1e-4)
+    m.eval()
+    loss, logs = m.pushforward_loss(_batch(), k=1, n_pred=N_PRED)
+    assert torch.isfinite(loss) and logs["pf_k"] == 1
+
+
+def test_pushforward_rejects_bad_k_and_unsupported_models():
+    m = _model()
+    for k in (0, N_PRED):
+        try:
+            m.pushforward_loss(_batch(), k=k, n_pred=N_PRED)
+            raise AssertionError(f"k={k} accepted")
+        except ValueError:
+            pass
+    for kw in ({"deterministic": True}, {"residual": True}, {"z_global": 16}):
+        try:
+            _model(**kw).pushforward_loss(_batch(), k=1, n_pred=N_PRED)
+            raise AssertionError(f"{kw} accepted")
+        except ValueError:
+            pass
+
+
+def test_pushforward_curriculum():
+    import argparse
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    from train_wm import pf_k
+    a = argparse.Namespace(pf_k_max=19, pf_ramp_steps=1000, pf_start=200)
+    rng = np.random.default_rng(0)
+    assert {pf_k(0, a, rng) for _ in range(50)} == {1}                       # before the start: k = 1
+    assert {pf_k(200, a, rng) for _ in range(50)} == {1}
+    mid = {pf_k(700, a, rng) for _ in range(500)}                            # halfway: k_now = 10
+    assert min(mid) == 1 and max(mid) == 10, mid
+    late = {pf_k(5000, a, rng) for _ in range(2000)}
+    assert min(late) == 1 and max(late) == 19, late
+

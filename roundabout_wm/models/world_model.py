@@ -463,6 +463,54 @@ class WorldModel(nn.Module):
         return loss, {"loss": loss.item(), "mse": mse_t.mean().item(), "mse_warm": mse_warm.item(),
                       "kl": kl.item(), "kl_anchor": anchor.item(), "prior_std": out["prior_std"].mean().item()} | lat
 
+    # ---- pushforward (recover from the model's own drift) ----------------------------------------------------------
+    def pushforward_loss(self, batch, k: int, n_pred: int, length: int = 1, beta: float | None = None):
+        """Pushforward trick (Brandstetter, Worrall & Welling, ICLR 2022, arXiv 2202.03376), applied through the ELBO.
+
+        1. Without gradient: warm up on the n_cond real frames, then roll k steps on the model's OWN prior samples
+           (as in imagination), reaching h at frame i0 = n_cond - 1 + k: a state that has drifted the way prior
+           rollouts drift (faded or displaced cars).
+        2. With gradient, from that detached state: `length` ordinary ELBO steps. The posterior reads the REAL next
+           frame, the decoder is scored against it, and KL(q || p) trains the prior at the drifted state.
+        So Pred / Dec / the posterior learn to put back what the rollout lost, and the prior learns what to expect
+        from such states. Through the latent rather than plain MSE: after k prior steps the rollout may be on a
+        different but plausible branch (a car waiting instead of going); the posterior absorbs which branch really
+        happened, so the decoder is not pushed towards the average of the branches (the blur of open-loop MSE).
+        No gradient flows through the k-step rollout (the trick's stop-gradient).
+
+        Only for the spatial-latent ConvGRU model without reencode / residual / z_global / z_seq.
+        Returns (loss, logs): loss = mean_t MSE + beta * mean_t KL + anchor_prior * mean_t KL(prior || N(0, I))."""
+        cfg, n = self.cfg, self.cfg.n_cond
+        if cfg.deterministic or cfg.z_seq or cfg.z_global or cfg.reencode or cfg.residual:
+            raise ValueError("pushforward_loss: spatial-latent stochastic model without reencode/residual only")
+        if not 1 <= k <= n_pred - length:
+            raise ValueError(f"pushforward_loss: need 1 <= k <= n_pred - length, got k {k}, n_pred {n_pred}, "
+                             f"length {length}")
+        imgs, act, spd = batch["images"], batch["actions"], batch["speed"]
+        with torch.no_grad():
+            h, _ = self.warmup(self.encode(imgs[:, :n]), act, spd)
+            for j in range(k):
+                i = n - 1 + j
+                mu_p, lv_p = self.prior_params(h)
+                h, _ = self.rollout_step(h, self._sample(mu_p, lv_p), act[:, i], spd[:, i])
+        h = h.detach()
+        i0 = n - 1 + k
+        e = self.encode(imgs[:, i0 + 1:i0 + 1 + length])
+        mses, kls, anchors = [], [], []
+        for j in range(length):
+            i = i0 + j
+            mu_p, lv_p = self.prior_params(h)
+            mu_q, lv_q = self.posterior(torch.cat([h, e[:, j]], 1))
+            kls.append(gauss_kl(mu_q, lv_q, mu_p, lv_p))
+            if cfg.anchor_prior > 0:
+                anchors.append(gauss_kl(mu_p, lv_p, torch.zeros_like(mu_p), torch.zeros_like(lv_p)))
+            h, g = self.rollout_step(h, self._sample(mu_q, lv_q), act[:, i], spd[:, i])
+            mses.append(((g.float() - imgs[:, i + 1, GREEN:GREEN + 1].float()) ** 2).mean())
+        mse, kl = torch.stack(mses).mean(), torch.stack(kls).mean()
+        anchor = torch.stack(anchors).mean() if anchors else torch.zeros((), device=mse.device)
+        loss = mse + (cfg.beta if beta is None else beta) * kl + cfg.anchor_prior * anchor
+        return loss, {"pf": loss.item(), "pf_mse": mse.item(), "pf_kl": kl.item(), "pf_k": float(k)}
+
     # ---- stage 2 initialisation ----------------------------------------------------------------------------------
     FRESH = ("prior.", "posterior.", "P_z.", "fut.")
 

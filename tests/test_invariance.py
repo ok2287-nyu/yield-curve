@@ -314,3 +314,20 @@ def test_train_wm_smoke_with_the_truth_target():
                         "--val_every", "1000", "--val_batches", "1", "--inv_weight", "0.1",
                         "--inv_masks", S["inv"], "--inv_target", "truth"], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
+
+
+def test_train_wm_smoke_with_pushforward_on_the_v4_recipe():
+    """The pushforward run's recipe: v4 (invariance, truth target) plus --pf_weight, k up to n_pred - 1 at once."""
+    S = _setup()
+    run = os.path.join(S["root"], "runs")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "train_wm.py"), "--cache", S["cache"],
+                        "--run", "inv4_pf", "--runs_dir", run, "--steps", "3", "--batch", "4", "--workers", "0",
+                        "--val_every", "1000", "--val_batches", "1", "--beta", "1e-4", "--anchor_prior", "1e-6",
+                        "--inv_weight", "0.1", "--inv_masks", S["inv"], "--inv_target", "truth",
+                        "--pf_weight", "1", "--pf_k_max", "19", "--pf_ramp_steps", "1"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
+    bad = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "train_wm.py"), "--cache", S["cache"],
+                          "--run", "x", "--runs_dir", run, "--pf_weight", "1", "--pf_k_max", "20"],
+                         capture_output=True, text=True)
+    assert bad.returncode != 0 and "pf_k_max" in bad.stderr

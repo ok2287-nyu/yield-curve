@@ -16,6 +16,11 @@ Action-invariance loss (fix B for lead mirroring; roundabout_wm/invariance.py), 
 Two extra 2 s rollouts per step (human vs counterfactual acceleration, z = prior mean); logs inv (the penalty),
 inv_area (share of pixels in the region) and inv_shift (mean ego displacement between the plans at the end, m).
 
+Pushforward loss (WorldModel.pushforward_loss; Brandstetter et al. 2022, suggested by Yair Schiff), off unless
+--pf_weight > 0: per step, roll k steps on the model's own prior samples without gradient, then one ELBO step against
+the real next frame; k ~ uniform{1 .. k_now}, k_now growing 1 -> --pf_k_max over --pf_ramp_steps. Logs pf, pf_mse,
+pf_kl, pf_k. On HPC with ab_inv4_01's exact recipe: scripts/hpc/pf_train.sbatch.
+
 DINO-WM-style model (roundabout_wm/models/dino_wm.py): frozen pretrained DINOv2 encoder, ViT predictor over the last
 4 frames (no GRU), optional per-step latent. Once, on a LOGIN node (compute nodes have no internet):
     pip install 'transformers<5'
@@ -172,6 +177,15 @@ def args_():
                         "on the true footprints of cars that cannot react, in both rollouts (with gradients)")
     p.add_argument("--inv_z", choices=["sample", "mean"], default="sample",
                    help="latent in the two rollouts: prior samples with shared noise (v2) or the prior mean (v1)")
+    p.add_argument("--pf_weight", type=float, default=0.0,
+                   help="pushforward loss weight (WorldModel.pushforward_loss; 0 = off): k steps on the model's own "
+                        "prior samples without gradient, then an ELBO step against the real next frame")
+    p.add_argument("--pf_k_max", type=int, default=19, help="pushforward: largest k (prior steps before the ELBO step)")
+    p.add_argument("--pf_ramp_steps", type=int, default=10000,
+                   help="pushforward curriculum: the largest k allowed grows linearly from 1 to --pf_k_max over this "
+                        "many training steps (counted from --pf_start); k is drawn uniformly from 1 .. that")
+    p.add_argument("--pf_start", type=int, default=0, help="pushforward: first training step with the loss on")
+    p.add_argument("--pf_len", type=int, default=1, help="pushforward: ELBO steps after the k-step drift")
     p.add_argument("--steps", type=int, default=60000, help="set after timing the first run; same for all runs")
     p.add_argument("--val_every", type=int, default=1000)
     p.add_argument("--val_batches", type=int, default=20)
@@ -193,7 +207,20 @@ def args_():
         p.error("--inv_weight does not support --reencode")
     if a.ss_steps > 0 and (a.arch != "dino" or a.teacher_forcing):
         p.error("--ss_steps needs --arch dino --no-teacher_forcing")
+    if a.pf_weight > 0:
+        if a.arch != "gru" or a.deterministic or a.reencode or a.residual or a.z_global or a.z_seq:
+            p.error("--pf_weight: spatial-latent stochastic gru model without reencode/residual/z_global/z_seq only")
+        if not 1 <= a.pf_k_max <= a.n_pred - a.pf_len:
+            p.error(f"--pf_k_max must be in 1 .. n_pred - pf_len = {a.n_pred - a.pf_len}")
     return a
+
+
+def pf_k(step: int, a, rng) -> int:
+    """Pushforward curriculum: k ~ uniform{1 .. k_now}, k_now = 1 + round((pf_k_max - 1) * progress), progress
+    rising linearly from 0 at --pf_start to 1 after --pf_ramp_steps more steps."""
+    prog = 1.0 if a.pf_ramp_steps <= 0 else min(1.0, max(0, step - a.pf_start) / a.pf_ramp_steps)
+    k_now = 1 + int(round((a.pf_k_max - 1) * prog))
+    return int(rng.integers(1, k_now + 1))
 
 
 def loaders(a, cfg):
@@ -349,7 +376,8 @@ def gpu_util():
 
 LOG_FIELDS = (["step", "split", "beta", "loss", "mse", "mse_warm", "feat", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar",
                "mean_gap", "post_mu_abs", "prior_mu_abs", "post_mu_spread", "act_sens", "gap_mean", "s_per_step",
-               "gpu_util", "time", "elbo", "inv", "inv_area", "inv_shift", "inv_mass_h", "inv_mass_c", "inv_guard"]
+               "gpu_util", "time", "elbo", "inv", "inv_area", "inv_shift", "inv_mass_h", "inv_mass_c", "inv_guard",
+               "pf", "pf_mse", "pf_kl", "pf_k"]
               + [f"{m}@{k}" for k in REPORT_STEPS for m in ("prior", "post", "empty", "copy", "warp", "mass", "kl",
                                                              "std", "spread", "sharp")])
 
@@ -497,8 +525,10 @@ def main():
         print(f"GPU {torch.cuda.get_device_name()} | {'bf16 autocast' if use_amp else 'fp32 (no native bf16)'}")
     keys = ("loss", "mse", "mse_warm", "kl", "kl_anchor", "prior_std", "post_logvar", "prior_logvar", "mean_gap", "post_mu_abs",
             "prior_mu_abs", "post_mu_spread") + (("feat",) if a.arch == "dino" else ()) + (("inv", "inv_area", "inv_shift", "inv_mass_h", "inv_mass_c", "inv_guard")
-                                                  if a.inv_weight > 0 else ())
+                                                  if a.inv_weight > 0 else ()) \
+        + (("pf", "pf_mse", "pf_kl", "pf_k") if a.pf_weight > 0 else ())
     inv_consts = tuple(float(x) for x in a.inv_consts.split(","))
+    pf_rng = np.random.default_rng(a.seed + 7 * step)               # k draws; reseeded on resume like torch
     last_ckpt, t0 = time.time(), time.time()
     run = {k: 0.0 for k in keys}; run_n = 0
     model.train()
@@ -517,6 +547,13 @@ def main():
                                                     guard=a.inv_guard, target=a.inv_target)
                     loss = loss + a.inv_weight * inv
                     logs = logs | inv_logs | {"loss": loss.item()}
+                if a.pf_weight > 0 and step >= a.pf_start:  # same dropout masks: the drift is this sequence's own
+                    pf, pf_logs = model.pushforward_loss(b, pf_k(step, a, pf_rng), a.n_pred, length=a.pf_len,
+                                                         beta=beta_at(step, a))
+                    loss = loss + a.pf_weight * pf
+                    logs = logs | pf_logs | {"loss": loss.item()}
+                elif a.pf_weight > 0:
+                    logs = logs | {"pf": 0.0, "pf_mse": 0.0, "pf_kl": 0.0, "pf_k": 0.0}
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss at step {step}: {logs}")
             opt.zero_grad(set_to_none=True)
