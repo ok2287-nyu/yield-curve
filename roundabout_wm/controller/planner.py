@@ -30,14 +30,17 @@ PLAN_ACC = {"brake": -3.0, "gentle": -1.5, "coast": 0.0, "nudge": 0.75, "go": 1.
 
 class ModelPlanner:
     def __init__(self, model, stats, cfg, cc: CostConfig | None = None, plans=PLAN_ACC, hold=True, T=10, samples=4,
-                 masks=4, seed=0, warp_ref=None, name="mpc", device=None, fallback=None):
+                 masks=4, seed=0, warp_ref=None, name="mpc", device=None, fallback=None, fallback_on="epi"):
         self.m, self.stats, self.cfg = model.eval(), stats, cfg
         self.cc = cc or CostConfig()
         self.plans, self.hold, self.T, self.S, self.M = dict(plans), hold, T, samples, masks
         self.seed, self.warp_ref, self.name = seed, warp_ref, name
-        # fallback: if the cheapest plan's epistemic term exceeds this, take the plan with the lowest imagined risk
-        # (ignoring progress, comfort and the epistemic penalty) instead
-        self.fallback = fallback
+        # fallback: if the cheapest plan's epistemic term (fallback_on="epi") or its imagined risk ("risk", the
+        # control: is the uncertainty needed, or does any high-risk trigger do?) exceeds this, take the plan with
+        # the lowest imagined risk (ignoring progress, comfort and the epistemic penalty) instead
+        if fallback_on not in ("epi", "risk"):
+            raise ValueError(f"fallback_on must be 'epi' or 'risk', got {fallback_on}")
+        self.fallback, self.fallback_on = fallback, fallback_on
         self.n_fallback = 0
         self.dev = device or next(model.parameters()).device
         self.names = list(self.plans) + (["hold"] if hold else [])
@@ -112,7 +115,8 @@ class ModelPlanner:
             self._observe(obs)
         paths, cm = self.score(obs)
         best = int(torch.argmin(cm["total"]))
-        fell = self.fallback is not None and float(cm["epistemic"][best]) > self.fallback
+        trig = cm["epistemic"] if self.fallback_on == "epi" else cm["risk"]
+        fell = self.fallback is not None and float(trig[best]) > self.fallback
         if fell:
             best = int(torch.argmin(cm["risk"]))
             self.n_fallback += 1

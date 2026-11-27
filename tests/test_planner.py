@@ -150,3 +150,56 @@ def test_fallback_takes_the_lowest_risk_plan_when_the_pick_is_uncertain(monkeypa
         assert ("fallback_share" in summ) == (fb is not None)
         if fb is not None:
             assert summ["fallback_share"] == (1.0 if want == "brake" else 0.0)
+
+
+def test_fallback_on_risk_is_the_control(monkeypatch):
+    """fallback_on="risk": the trigger is the cheapest plan's imagined RISK (go: 1.0), not its epistemic term.
+    Threshold 0.5 -> brake (lowest risk); 2.0 -> go. The epistemic term no longer matters (set to 0 here)."""
+    S = _setup()
+    env, cfg = S["env"], S["cfg"]
+
+    def fake_imagine(m, h, paths, *a, **k):
+        P, T = paths["acc"].shape
+        return {"green": torch.zeros(1, 1, P, T, 64, 64), "speed": paths["state"][:, :, 3], "acc": paths["acc"],
+                "curv": paths["curv"]}
+
+    def fake_costs(*a, **k):
+        return {"total": torch.tensor([5., 4, 3, 2, 1, 6]), "risk": torch.tensor([0.1, 1, 1, 1, 1, 1]),
+                "epistemic": torch.zeros(6)}
+
+    monkeypatch.setattr(planner_mod, "imagine", fake_imagine)
+    monkeypatch.setattr(planner_mod, "plan_costs", fake_costs)
+    for fb, want in ((0.5, "brake"), (2.0, "go")):
+        pol = ModelPlanner(S["m"], S["stats"], cfg, samples=1, masks=1, fallback=fb, fallback_on="risk")
+        pol.record_trace = True
+        obs = env.reset(S["w"])
+        pol.reset(env)
+        pol.act(env, obs)
+        assert pol.trace[-1]["pick"] == want
+    epi = ModelPlanner(S["m"], S["stats"], cfg, samples=1, masks=1, fallback=0.5)    # default trigger: epistemic 0
+    epi.record_trace = True
+    obs = env.reset(S["w"])
+    epi.reset(env)
+    epi.act(env, obs)
+    assert epi.trace[-1]["pick"] == "go"
+    try:
+        ModelPlanner(S["m"], S["stats"], cfg, fallback_on="gap")
+        raise AssertionError("bad fallback_on accepted")
+    except ValueError:
+        pass
+
+
+def test_replay_eval_risk_fallback_and_headway_flags():
+    S = _setup()
+    out = os.path.join(S["root"], "re_ctl.csv")
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "replay_eval.py"), "--cache", S["cache"],
+                        "--data_dir", S["raw"], "--n_windows", "2", "--horizon", "4", "--policies", "human",
+                        "--ckpts", S["ck"], "--planners", "mpc", "--samples", "1", "--masks", "2",
+                        "--fallback_thresh", "0.5", "--fallback_on", "risk", "--headway", "--out", out],
+                       capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=ROOT), cwd=S["root"])
+    assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-2500:]
+    assert "mpc:fake@fallback_risk=0.5+hw" in r.stdout and "headway guard" in r.stdout
+    import pandas as pd
+    df = pd.read_csv(out)
+    g = df[df.policy == "mpc:fake@fallback_risk=0.5+hw"]
+    assert len(g) == 2 and g.hw_share.between(0, 1).all() and g.fallback_share.between(0, 1).all()

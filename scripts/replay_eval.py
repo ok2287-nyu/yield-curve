@@ -60,7 +60,8 @@ def load_planners(a, cfg):
     extra = {k: v for k, v in (("w_epi", a.w_epi), ("epi_thresh", getattr(a, "epi_thresh", None))) if v is not None}
     cc = CostConfig(w_prog=a.w_prog, **extra)
     fb = getattr(a, "fallback_thresh", None)
-    named = {**extra, **({"fallback": fb} if fb is not None else {})}
+    fb_on = getattr(a, "fallback_on", "epi")
+    named = {**extra, **({"fallback" if fb_on == "epi" else "fallback_risk": fb} if fb is not None else {})}
     tag = "" if not named else "@" + ",".join(f"{k}={v:g}" for k, v in named.items())   # distinguishes variants
     print(f"model planners: {cc.to_dict()}")
     out = {}
@@ -74,7 +75,8 @@ def load_planners(a, cfg):
                 raise ValueError(f"unknown planner {kind}")
             out[f"{kind}:{run}{tag}"] = ModelPlanner(m, s["stats"], cfg, cc=cc, T=a.plan_T, samples=a.samples, masks=a.masks,
                                                 seed=a.seed, warp_ref="coast" if kind == "mpc_warp" else None,
-                                                name=f"{kind}:{run}", device=dev, fallback=fb)
+                                                name=f"{kind}:{run}", device=dev, fallback=fb,
+                                                fallback_on=fb_on)
     return out
 
 
@@ -128,12 +130,25 @@ def main():
     p.add_argument("--fallback_thresh", type=float, default=None,
                    help="planner fallback: when the cheapest plan's epistemic term exceeds this, take the plan with the "
                         "lowest imagined risk instead (name suffix @fallback=<value>)")
+    p.add_argument("--fallback_on", choices=["epi", "risk"], default="epi",
+                   help="what triggers the fallback: the cheapest plan's epistemic term (default) or its imagined risk "
+                        "(the control; name suffix @fallback_risk=<value>)")
+    p.add_argument("--headway", action="store_true",
+                   help="wrap every model planner and learned policy in the headway guard (controller/headway.py): "
+                        "observed gap and lead speed, constant-speed projection; names get '+hw'")
+    p.add_argument("--hw_d0", type=float, default=1.0, help="headway guard: standstill margin, m")
+    p.add_argument("--hw_tau", type=float, default=0.5, help="headway guard: time gap, s")
+    p.add_argument("--hw_H", type=int, default=20, help="headway guard: projection horizon, steps (20 = 4 s)")
     a = p.parse_args()
     cfg = Config()
     split = json.load(open(os.path.join(a.cache, "split.json")))[a.split]
     env = ReplayEnv(a.cache, a.data_dir, split, cfg, horizon=a.horizon, reactive=a.reactive)
     idx = np.sort(np.random.default_rng(a.seed).choice(len(env.ds), min(a.n_windows, len(env.ds)), replace=False))
     planners = {**load_planners(a, cfg), **load_policies(a, cfg)}
+    if a.headway:
+        from roundabout_wm.controller.headway import HeadwayGuard
+        planners = {f"{k}+hw": HeadwayGuard(v, d0=a.hw_d0, tau=a.hw_tau, H=a.hw_H, plan_T=a.plan_T, name=f"{k}+hw")
+                    for k, v in planners.items()}
     names = [x for x in a.policies.split(",") if x] + list(planners)
     rows = []
     for j, i in enumerate(idx):
@@ -153,9 +168,12 @@ def main():
     pick_cols = [c for c in df if c.startswith("pick_")]
     if pick_cols:
         print("\nmodel planners: share of steps each plan was picked; imagined risk of the picks (mean)")
-        extra_cols = [c for c in ("fallback_share",) if c in df]
+        extra_cols = [c for c in ("fallback_share", "hw_share") if c in df]
         print(df[df.policy.isin(list(planners))].groupby("policy", sort=False)[pick_cols + ["imagined_risk"] + extra_cols]
               .mean().round(3).to_string())
+    if "hw_share" in df:
+        print("\nheadway guard: share of steps it replaced the controller's acceleration")
+        print(df[df.hw_share.notna()].groupby("policy", sort=False)["hw_share"].mean().round(3).to_string())
     summary(df[df.window.isin(traffic)], f"traffic: human had a road user < {a.near:g} m ahead")
     bad = hum[hum.col_front | hum.col_side]
     if len(bad):
